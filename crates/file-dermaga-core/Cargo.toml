@@ -1,0 +1,8 @@
+[package]
+name = "file-dermaga-core"
+description = "Core types and FTP directory listing parser for FileDermaga"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

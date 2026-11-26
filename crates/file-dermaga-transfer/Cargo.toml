@@ -1,0 +1,13 @@
+[package]
+name = "file-dermaga-transfer"
+description = "Backend-neutral file operations and recursive transfers for FileDermaga"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+file-dermaga-core.workspace = true
+file-dermaga-ftp.workspace = true
+file-dermaga-s3.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

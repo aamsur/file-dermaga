@@ -1,0 +1,5 @@
+/target
+# Machine-specific cargo settings (e.g. a local target-dir)
+/.cargo/config.toml
+# Editor local history
+/.history

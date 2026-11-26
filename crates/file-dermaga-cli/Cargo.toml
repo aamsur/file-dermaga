@@ -1,0 +1,22 @@
+[package]
+name = "file-dermaga-cli"
+description = "Command line FTP/FTPS/S3 client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "file-dermaga"
+path = "src/main.rs"
+
+[dependencies]
+file-dermaga-core.workspace = true
+file-dermaga-ftp.workspace = true
+file-dermaga-s3.workspace = true
+file-dermaga-transfer.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+url.workspace = true
+percent-encoding = "2"
+rpassword = "7"

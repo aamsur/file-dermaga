@@ -1,0 +1,66 @@
+name: Release
+
+# Builds the .deb on the oldest supported Ubuntu (22.04) so it installs on
+# 22.04 and newer, and attaches it to the published GitHub Release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: # manual run: builds the .deb as a workflow artifact only
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-about
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked -p file-dermaga-cli
+          cargo build --release --locked -p file-dermaga-gui --features custom-protocol
+
+      - name: Generate third-party license notices
+        run: cargo about generate -c packaging/about.toml packaging/about.hbs -o target/release/THIRD-PARTY-LICENSES.html
+
+      - name: Build .deb
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="file-dermaga-gui") | .version')"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          cargo deb -p file-dermaga-gui --no-build --deb-version "$VERSION"
+          ls -l target/debian/
+          dpkg-deb --info target/debian/*.deb
+          dpkg-deb --contents target/debian/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: file-dermaga-deb
+          path: target/debian/*.deb
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" target/debian/*.deb --clobber

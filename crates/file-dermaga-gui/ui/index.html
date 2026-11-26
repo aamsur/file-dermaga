@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FileDermaga</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <nav id="menubar">
+    <div class="menu" data-menu="file">File</div>
+    <div class="menu" data-menu="view">View</div>
+    <div class="menu" data-menu="transfer">Transfer</div>
+    <div class="menu" data-menu="server">Server</div>
+    <div class="menu" data-menu="help">Help</div>
+  </nav>
+
+  <div id="toolbar">
+    <span class="tb-split">
+      <button class="tb" data-cmd="site-manager" title="Open the Site Manager (Ctrl+S)"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></button><button class="tb tb-arrow" data-cmd="sites-dropdown" title="Connect to a saved site">▾</button>
+    </span>
+    <span class="sep"></span>
+    <button class="tb toggle on" data-cmd="toggle-log" title="Toggle message log"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.5"/><path d="M6 8h12M6 11h12M6 14h8"/></svg></button>
+    <button class="tb toggle on" data-cmd="toggle-local-tree" title="Toggle local directory tree"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.5"/><path d="M3 9h18M10 9v11"/><path class="fill" d="M3.8 9.8h5.4v9.4H3.8z"/></svg></button>
+    <button class="tb toggle on" data-cmd="toggle-remote-tree" title="Toggle remote directory tree"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.5"/><path d="M3 9h18M14 9v11"/><path class="fill" d="M14.8 9.8h5.4v9.4h-5.4z"/></svg></button>
+    <button class="tb toggle on" data-cmd="toggle-queue" title="Toggle transfer queue"><svg viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></svg></button>
+    <span class="sep"></span>
+    <button class="tb" data-cmd="refresh" title="Refresh the file and folder lists (F5)"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/></svg></button>
+    <button class="tb" data-cmd="cancel-all" title="Cancel all transfers"><svg viewBox="0 0 24 24" class="danger"><circle cx="12" cy="12" r="8.5"/><path d="M9 9l6 6M15 9l-6 6"/></svg></button>
+    <button class="tb" data-cmd="disconnect" title="Disconnect from the server"><svg viewBox="0 0 24 24"><path d="M7 7l10 10M5 12h3M16 12h3M10 5l1 3M13 16l1 3"/></svg></button>
+    <button class="tb" data-cmd="reconnect" title="Reconnect to the last used server"><svg viewBox="0 0 24 24"><path d="M5 12h4M15 12h4M9 9h6v6H9z"/></svg></button>
+  </div>
+
+  <form id="quickconnect" autocomplete="off">
+    <label>Host:<input name="host" size="16" placeholder="ftp.example.com" spellcheck="false"></label>
+    <label>Username:<input name="user" size="12" spellcheck="false"></label>
+    <label>Password:<input name="password" type="password" size="12"></label>
+    <label>Port:<input name="port" size="4" inputmode="numeric"></label>
+    <span class="split-btn">
+      <button type="submit" id="qc-go">Quickconnect</button><button type="button" id="qc-history" title="Recent connections">▾</button>
+    </span>
+  </form>
+
+  <div id="log" class="block"></div>
+  <div class="splitter h" data-var="--log-h" data-target="log"></div>
+
+  <div id="panes">
+    <section class="side" id="local">
+      <div class="pathbar">
+        <label for="local-path">Local site:</label>
+        <input id="local-path" class="path" spellcheck="false">
+      </div>
+      <div class="tree block"></div>
+      <div class="splitter h inner" data-var="--tree-h"></div>
+      <div class="list block" tabindex="0"></div>
+      <div class="statusline"></div>
+    </section>
+    <div class="splitter v" data-var="--left-w"></div>
+    <section class="side" id="remote">
+      <div class="pathbar">
+        <label for="remote-path">Remote site:</label>
+        <input id="remote-path" class="path" spellcheck="false">
+      </div>
+      <div class="tree block"></div>
+      <div class="splitter h inner" data-var="--tree-h"></div>
+      <div class="list block" tabindex="0"></div>
+      <div class="statusline"></div>
+    </section>
+  </div>
+
+  <div class="splitter h" data-var="--queue-h" data-target="queue" data-invert="1"></div>
+  <div id="queue" class="block">
+    <table class="grid">
+      <thead><tr>
+        <th style="width:34%">Server/Local file</th><th style="width:7%">Direction</th>
+        <th style="width:27%">Remote file</th><th style="width:8%" class="num">Size</th>
+        <th style="width:7%">Priority</th><th>Status</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div id="queue-tabs">
+    <button class="tab active" data-tab="queued">Queued files</button>
+    <button class="tab" data-tab="failed">Failed transfers</button>
+    <button class="tab" data-tab="success">Successful transfers</button>
+  </div>
+  <footer id="statusbar">
+    <span id="conn-state"></span>
+    <span class="grow"></span>
+    <span id="queue-state">Queue: empty</span>
+  </footer>
+</div>
+
+<div id="popup-root"></div>
+<script src="app.js"></script>
+</body>
+</html>
