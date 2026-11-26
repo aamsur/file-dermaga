@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use file_dermaga_core::{Accuracy, DateTime, DirEntry};
 use file_dermaga_ftp::{FtpClient, FtpConfig, LogKind, Logger, Security};
 use file_dermaga_s3::{S3Client, S3Config, UploadOptions};
-use file_dermaga_sftp::{SftpClient, SftpConfig};
+use file_dermaga_sftp::{KbdRequest, Prompter, SftpClient, SftpConfig};
 use file_dermaga_webdav::{WebdavClient, WebdavConfig};
 use file_dermaga_transfer::{
     basename, decide, Backend, BoxFuture, Conflict, Decision, Event, ExistsAction, FileInfo, Limiter, Outcome, Resolver,
@@ -78,6 +78,9 @@ struct Site {
     /// accepted keys go to ~/.ssh/known_hosts).
     #[serde(skip_serializing)]
     trust_host_key: String,
+    /// Trust `trust_host_key` for this session only (not saved to known_hosts).
+    #[serde(skip_serializing)]
+    trust_once: bool,
     // WebDAV
     /// Path of the WebDAV root on the server, e.g. /remote.php/dav/files/alice
     base_path: String,
@@ -197,6 +200,44 @@ struct AppState {
     /// Open "file exists" questions, answered by `conflict_answer`.
     prompts: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<Decision>, Conflict)>>,
     next_prompt: AtomicU64,
+    /// Open keyboard-interactive questions, answered by `auth_prompt_answer`.
+    auth_prompts: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Option<Vec<String>>>>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthPromptDto {
+    prompt_id: u64,
+    host: String,
+    name: String,
+    instructions: String,
+    prompts: Vec<(String, bool)>,
+}
+
+/// Keyboard-interactive questions (OTP codes etc.) are shown in a dialog.
+fn gui_prompter(app: &AppHandle, host: String) -> Prompter {
+    let app = app.clone();
+    Arc::new(move |req: KbdRequest| {
+        let app = app.clone();
+        let host = host.clone();
+        Box::pin(async move {
+            let state = app.try_state::<AppState>()?;
+            let prompt_id = state.next_prompt.fetch_add(1, Ordering::Relaxed) + 1;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.auth_prompts.lock().unwrap().insert(prompt_id, tx);
+            let dto = AuthPromptDto { prompt_id, host, name: req.name, instructions: req.instructions, prompts: req.prompts };
+            let _ = app.emit("auth-prompt", dto);
+            rx.await.ok().flatten()
+        })
+    })
+}
+
+#[tauri::command]
+fn auth_prompt_answer(state: State<'_, AppState>, prompt_id: u64, answers: Option<Vec<String>>) -> CmdResult<()> {
+    if let Some(tx) = state.auth_prompts.lock().unwrap().remove(&prompt_id) {
+        let _ = tx.send(answers);
+    }
+    Ok(())
 }
 
 impl AppState {
@@ -374,6 +415,7 @@ fn sftp_config_of(site: &Site) -> CmdResult<SftpConfig> {
     cfg.key_file = opt(&site.key_file).map(|p| expand_home(&p));
     cfg.key_passphrase = (!site.key_passphrase.is_empty()).then(|| site.key_passphrase.clone());
     cfg.trust_fingerprint = opt(&site.trust_host_key);
+    cfg.remember_host_key = !site.trust_once;
     Ok(cfg)
 }
 
@@ -465,6 +507,7 @@ async fn connect(app: AppHandle, state: State<'_, AppState>, mut site: Site) -> 
         let mut cfg = sftp_config_of(&site)?;
         let app2 = app.clone();
         cfg.status = Some(Arc::new(move |m: &str| log(&app2, "status", m)));
+        cfg.prompter = Some(gui_prompter(&app, cfg.host.clone()));
         let client = SftpClient::connect(&cfg).await.map_err(|e| {
             let m = format!("{e:#}");
             log(&app, "error", format!("Could not connect to server: {m}"));
@@ -474,7 +517,9 @@ async fn connect(app: AppHandle, state: State<'_, AppState>, mut site: Site) -> 
         // Transfers reuse the settings; the host key is in known_hosts now.
         let mut transfer_cfg = cfg.clone();
         transfer_cfg.status = None;
-        transfer_cfg.trust_fingerprint = None;
+        if cfg.remember_host_key {
+            transfer_cfg.trust_fingerprint = None; // it is in known_hosts now
+        }
         let user = if cfg.user.is_empty() { std::env::var("USER").unwrap_or_default() } else { cfg.user.clone() };
         let session = Session {
             label: format!("sftp://{user}@{}", cfg.host),
@@ -580,7 +625,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(12);
 /// Try a site's settings without opening a session (like a database tool's
 /// "Test connection"): connect, authenticate, read the start directory.
 #[tauri::command]
-async fn test_connection(mut site: Site) -> CmdResult<TestReport> {
+async fn test_connection(app: AppHandle, mut site: Site) -> CmdResult<TestReport> {
     split_host(&mut site);
     let site = blocking(move || {
         fill_secrets(&mut site);
@@ -593,6 +638,7 @@ async fn test_connection(mut site: Site) -> CmdResult<TestReport> {
     if site.protocol == "sftp" {
         let mut cfg = sftp_config_of(&site)?;
         cfg.timeout = TEST_TIMEOUT;
+        cfg.prompter = Some(gui_prompter(&app, cfg.host.clone()));
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = lines.clone();
         cfg.status = Some(Arc::new(move |m: &str| sink.lock().unwrap().push(format!("Status:   {m}"))));
@@ -749,16 +795,48 @@ async fn disconnect(app: AppHandle, state: State<'_, AppState>, session: u32) ->
     Ok(())
 }
 
-/// Run an operation on the session's browsing connection.
-async fn with_browse<T>(
-    state: &State<'_, AppState>,
-    session: u32,
-    f: impl AsyncFnOnce(&mut Backend) -> anyhow::Result<T>,
-) -> CmdResult<T> {
-    let s = state.session(session)?;
-    let mut guard = s.browse.lock().await;
-    let b = guard.as_mut().ok_or("Not connected")?;
-    f(b).await.map_err(err_chain)
+/// Errors that mean the connection itself is gone.
+fn looks_disconnected(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}").to_ascii_lowercase();
+    [
+        "connection closed", "broken pipe", "connection reset", "not connected", "disconnected", "channel closed",
+        "session closed", "connection lost", "no connection", "unexpected eof", "send error", "senderror", "timed out",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+}
+
+/// Run `$body` (using `$b: &mut Backend`) on the session's browsing
+/// connection. FTP and SFTP connections that dropped while idle are reopened
+/// once and the operation is repeated. A macro rather than a function so the
+/// body is inlined (a generic async-closure parameter cannot prove `Send`).
+macro_rules! with_browse {
+    ($app:expr, $state:expr, $session:expr, |$b:ident| $body:expr) => {
+        async {
+            let s = $state.session($session)?;
+            let mut guard = s.browse.lock().await;
+            let first = {
+                let $b: &mut Backend = guard.as_mut().ok_or("Not connected")?;
+                $body
+            };
+            match first {
+                Ok(v) => Ok(v),
+                Err(e) if matches!(s.kind, Kind::Ftp(_) | Kind::Sftp(_)) && looks_disconnected(&e) => {
+                    log($app, "status", "Connection lost, reconnecting...");
+                    let fresh = s.transfer_backend().await.map_err(|e| {
+                        let m = format!("Reconnect failed: {e:#}");
+                        log($app, "error", m.clone());
+                        m
+                    })?;
+                    log($app, "status", "Reconnected");
+                    let $b: &mut Backend = guard.insert(fresh);
+                    ($body).map_err(err_chain)
+                }
+                Err(e) => Err(err_chain(e)),
+            }
+        }
+        .await
+    };
 }
 
 fn s3_path(path: &str) -> &str {
@@ -782,7 +860,7 @@ async fn remote_list(app: AppHandle, state: State<'_, AppState>, session: u32, p
     let s = state.session(session)?;
     let p = backend_path(&s, &path);
     log(&app, "status", format!("Retrieving directory listing of \"{path}\"..."));
-    let res = with_browse(&state, session, async |b| b.list(&p).await).await;
+    let res: CmdResult<Vec<DirEntry>> = with_browse!(&app, &state, session, |b| b.list(&p).await);
     match res {
         Ok(entries) => {
             log(&app, "status", format!("Directory listing of \"{path}\" successful"));
@@ -799,7 +877,7 @@ async fn remote_list(app: AppHandle, state: State<'_, AppState>, session: u32, p
 async fn remote_mkdir(app: AppHandle, state: State<'_, AppState>, session: u32, path: String) -> CmdResult<()> {
     let s = state.session(session)?;
     let p = backend_path(&s, &path);
-    let r = with_browse(&state, session, async |b| b.mkdir(&p).await).await;
+    let r: CmdResult<()> = with_browse!(&app, &state, session, |b| b.mkdir(&p).await);
     match &r {
         Ok(()) => log(&app, "status", format!("Created directory \"{path}\"")),
         Err(e) => log(&app, "error", e.clone()),
@@ -819,14 +897,13 @@ async fn remote_delete(app: AppHandle, state: State<'_, AppState>, session: u32,
     let s = state.session(session)?;
     for item in items {
         let p = backend_path(&s, &item.path);
-        let r = with_browse(&state, session, async |b| {
+        let r: CmdResult<()> = with_browse!(&app, &state, session, |b| {
             if item.is_dir {
                 b.rmdir(&p, true).await
             } else {
                 b.delete(&p).await
             }
-        })
-        .await;
+        });
         match r {
             Ok(()) => log(&app, "status", format!("Deleted \"{}\"", item.path)),
             Err(e) => {
@@ -850,7 +927,7 @@ async fn remote_rename(
     let s = state.session(session)?;
     let (f, t) = (backend_path(&s, &from), backend_path(&s, &to));
     let ow = overwrite.unwrap_or(false);
-    let r = with_browse(&state, session, async |b| b.rename(&f, &t, ow).await).await;
+    let r: CmdResult<()> = with_browse!(&app, &state, session, |b| b.rename(&f, &t, ow).await);
     match &r {
         Ok(()) => log(&app, "status", format!("Renamed \"{from}\" to \"{to}\"")),
         Err(e) => log(&app, "error", e.clone()),
@@ -1388,6 +1465,7 @@ fn main() {
             limiter: Limiter::default(),
             prompts: Mutex::new(HashMap::new()),
             next_prompt: AtomicU64::new(0),
+            auth_prompts: Mutex::new(HashMap::new()),
         })
         .setup(|_app| {
             migrate_legacy_config(_app.handle());
@@ -1421,6 +1499,7 @@ fn main() {
             transfer_cancel,
             conflict_answer,
             set_transfer_limits,
+            auth_prompt_answer,
             sites_load,
             sites_save,
             test_connection,

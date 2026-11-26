@@ -29,6 +29,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 /// Status messages for a log view.
 pub type StatusFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// One keyboard-interactive request (RFC 4256): show `prompts` (text,
+/// echo) and return the answers, or `None` to cancel.
+#[derive(Clone, Debug)]
+pub struct KbdRequest {
+    pub name: String,
+    pub instructions: String,
+    pub prompts: Vec<(String, bool)>,
+}
+
+pub type Prompter =
+    Arc<dyn Fn(KbdRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<String>>> + Send>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct SftpConfig {
     pub host: String,
@@ -46,8 +58,12 @@ pub struct SftpConfig {
     /// Accept and remember any unknown host key (like OpenSSH's
     /// `StrictHostKeyChecking=accept-new`). Changed keys are still refused.
     pub accept_new_host_key: bool,
+    /// Save a trusted fingerprint to known_hosts (false = this session only).
+    pub remember_host_key: bool,
     pub timeout: Duration,
     pub status: Option<StatusFn>,
+    /// Answers keyboard-interactive questions (OTP codes etc.).
+    pub prompter: Option<Prompter>,
 }
 
 impl fmt::Debug for SftpConfig {
@@ -73,8 +89,10 @@ impl SftpConfig {
             known_hosts: None,
             trust_fingerprint: None,
             accept_new_host_key: false,
+            remember_host_key: true,
             timeout: Duration::from_secs(20),
             status: None,
+            prompter: None,
         }
     }
 
@@ -133,6 +151,7 @@ struct Handler {
     known_hosts: PathBuf,
     trust: Option<String>,
     accept_new: bool,
+    remember: bool,
     problem: Arc<Mutex<Option<HostKeyError>>>,
     status: Option<StatusFn>,
 }
@@ -168,7 +187,13 @@ impl client::Handler for Handler {
             }
             // Not recorded (or no known_hosts file yet).
             _ => {
-                if self.accept_new || self.trust.as_deref() == Some(fingerprint.as_str()) {
+                let trusted = self.trust.as_deref() == Some(fingerprint.as_str());
+                if trusted && !self.remember {
+                    if let Some(s) = &self.status {
+                        s(&format!("Trusting host key {fingerprint} for this session only"));
+                    }
+                    Ok(true)
+                } else if self.accept_new || trusted {
                     self.learn(key);
                     if let Some(s) = &self.status {
                         s(&format!("Added host key {fingerprint} to {}", self.known_hosts.display()));
@@ -323,19 +348,63 @@ async fn auth_with_key(
 }
 
 async fn auth_with_password(handle: &mut Handle<Handler>, user: &str, password: &str) -> Result<bool> {
-    if handle.authenticate_password(user, password).await?.success() {
-        return Ok(true);
-    }
-    // Many servers only allow keyboard-interactive for passwords.
-    let mut resp = handle.authenticate_keyboard_interactive_start(user, None::<String>).await?;
-    for _ in 0..5 {
-        match resp {
-            KeyboardInteractiveAuthResponse::Success => return Ok(true),
-            KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
-            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                let answers = prompts.iter().map(|_| password.to_owned()).collect();
-                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+    Ok(handle.authenticate_password(user, password).await?.success())
+}
+
+/// Is this a plain "Password:" prompt that the stored password answers?
+fn is_password_prompt(text: &str, user: &str) -> bool {
+    let t = text.trim().trim_end_matches(':').trim().to_ascii_lowercase();
+    t == "password" || t.starts_with("password for") || t == format!("{user}'s password").to_ascii_lowercase()
+}
+
+/// Keyboard-interactive (RFC 4256). A single "Password:" prompt is answered
+/// with the stored password once; anything else (OTP codes, extra prompts)
+/// goes to the prompter. Rejected answers restart the exchange, up to 3
+/// times, so a mistyped code can be re-entered. `Err` = cancelled.
+async fn auth_keyboard_interactive(
+    handle: &mut Handle<Handler>,
+    user: &str,
+    password: &str,
+    prompter: Option<&Prompter>,
+) -> Result<bool> {
+    let mut password_sent = false;
+    for _attempt in 0..3 {
+        let mut resp = handle.authenticate_keyboard_interactive_start(user, None::<String>).await?;
+        let mut asked_user = false;
+        for _ in 0..10 {
+            match resp {
+                KeyboardInteractiveAuthResponse::Success => return Ok(true),
+                KeyboardInteractiveAuthResponse::Failure { .. } => break,
+                KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
+                    let answers = if prompts.is_empty() {
+                        Vec::new()
+                    } else if prompts.len() == 1 && !password.is_empty() && !password_sent && is_password_prompt(&prompts[0].prompt, user) {
+                        password_sent = true;
+                        vec![password.to_owned()]
+                    } else if let Some(p) = prompter {
+                        asked_user = true;
+                        let req = KbdRequest {
+                            name,
+                            instructions,
+                            prompts: prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect(),
+                        };
+                        match p(req).await {
+                            Some(a) => a,
+                            None => bail!("authentication cancelled by the user"),
+                        }
+                    } else if !password.is_empty() && !password_sent {
+                        password_sent = true;
+                        prompts.iter().map(|_| password.to_owned()).collect()
+                    } else {
+                        return Ok(false);
+                    };
+                    resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+                }
             }
+        }
+        // Only retry when the user typed something that may have been wrong.
+        if !asked_user {
+            break;
         }
     }
     Ok(false)
@@ -376,6 +445,7 @@ impl SftpClient {
             known_hosts,
             trust: cfg.trust_fingerprint.clone(),
             accept_new: cfg.accept_new_host_key,
+            remember: cfg.remember_host_key,
             problem: problem.clone(),
             status: cfg.status.clone(),
         };
@@ -431,10 +501,14 @@ impl SftpClient {
                 }
             }
         }
-        // 2. password, 3. keyboard-interactive answered with the password.
+        // 2. password, 3. keyboard-interactive (password prompt or dialog).
         if !ok && !cfg.password.is_empty() {
             tried.push("password".into());
             ok = auth_with_password(&mut handle, &user, &cfg.password).await?;
+        }
+        if !ok && (!cfg.password.is_empty() || cfg.prompter.is_some()) && user != "anonymous" {
+            tried.push("keyboard-interactive".into());
+            ok = auth_keyboard_interactive(&mut handle, &user, &cfg.password, cfg.prompter.as_ref()).await?;
         }
         if !ok {
             let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;

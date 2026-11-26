@@ -250,6 +250,23 @@ const conflicts = {
   },
 };
 
+/** Keyboard-interactive questions from an SSH server (passwords, OTP codes). */
+let authChain = Promise.resolve();
+function authPrompt(p) {
+  authChain = authChain.then(async () => {
+    const inputs = p.prompts.map(([text, echo]) => [text, el("input", { class: "full", type: echo ? "text" : "password", autocomplete: "one-time-code" })]);
+    const body = [
+      el("p", {}, `${p.host} asks for additional authentication.${p.instructions ? "\n\n" + p.instructions : ""}`),
+      ...inputs.flatMap(([text, input]) => [el("label", { class: "kbd-label" }, text), input]),
+    ];
+    const res = await dialog(p.name || "Authentication required", body, [
+      { label: "Cancel", value: null },
+      { label: "OK", value: () => inputs.map(([, i]) => i.value), primary: true },
+    ]);
+    await invoke("auth_prompt_answer", { promptId: p.promptId, answers: res }).catch((e) => log("error", errText(e)));
+  });
+}
+
 async function loadSites() {
   try {
     S.sites = await invoke("sites_load");
@@ -1368,15 +1385,19 @@ async function connect(site) {
       return ok;
     }
     if (msg.startsWith("UNKNOWN_HOST_KEY ")) {
-      const fp = msg.split(/\s+/)[1];
-      const ok = await confirmDlg(
+      const [, fp, alg] = msg.match(/^UNKNOWN_HOST_KEY (\S+) \(([^)]*)\)/) || [null, msg.split(/\s+/)[1], ""];
+      const choice = await dialog(
         "Unknown host key",
-        `This is the first connection to ${site.host}. The server identifies itself with the host key fingerprint\n\n${fp}\n\n` +
-          "Only trust it if it matches the fingerprint given by the server administrator. It will be saved to ~/.ssh/known_hosts.",
-        "Trust and connect",
+        el("p", {}, `This is the first connection to ${site.host}${site.port ? ":" + site.port : ""}. The server identifies itself with the ${alg} host key fingerprint\n\n${fp}\n\n` +
+          "Only trust it if it matches the fingerprint given by the server administrator. \u201cAlways trust\u201d saves it to ~/.ssh/known_hosts."),
+        [
+          { label: "Cancel", value: null },
+          { label: "Trust once", value: "once", id: "once" },
+          { label: "Always trust", value: "always", primary: true },
+        ],
       );
       setConnState("Not connected");
-      return ok ? connect({ ...site, trustHostKey: fp }) : false;
+      return choice ? connect({ ...site, trustHostKey: fp, trustOnce: choice === "once" }) : false;
     }
     if (msg.startsWith("HOST_KEY_CHANGED ")) {
       alertDlg("WARNING: host key changed", msg);
@@ -2033,6 +2054,7 @@ async function init() {
   loadSites();
   await listen("transfer", (e) => queue.onEvent(e.payload));
   await listen("transfer-conflict", (e) => conflicts.push(e.payload));
+  await listen("auth-prompt", (e) => authPrompt(e.payload));
   applyTransferSettings();
 
   panes.remote.clear("Not connected to any server");

@@ -321,3 +321,4 @@ form.settings .check, .cf-actions .check, .dialog .body > .check { display: flex
 .cf-path { font-family: ui-monospace, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; -webkit-user-select: text; }
 .cf-meta { color: var(--muted); font-size: 12px; }
 .cf-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; margin: 10px 0; }
+.kbd-label { display: block; margin: 8px 0 3px; }

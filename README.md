@@ -19,6 +19,8 @@
 - Local and remote panes, each with a directory tree and a sortable file list
 - Drag & drop, double‑click to transfer, context menus and keyboard shortcuts
 - Transfer queue with progress, speed, cancel and retry; recursive folder transfers
+- When a target exists: ask, overwrite, overwrite if newer / if size differs, **resume**, rename or skip (separately for downloads and uploads)
+- Resume interrupted transfers (downloads on all protocols; uploads over FTP and SFTP), global speed limits, optional preservation of modification times
 - Message log with the full protocol conversation
 - Site Manager with a **Test connection** button and a quick‑connect dropdown in the toolbar
 - Passwords and S3 secret keys are stored in the **system keyring** (GNOME Keyring / Secret Service), never in plain text files
@@ -71,6 +73,8 @@ A Rust toolchain ≥ 1.85 is required ([rustup.rs](https://rustup.rs)).
 - **Site Manager** (`Ctrl+S`): save connections, then pick them from the **▾** next to the Site Manager button. Use **Test connection** to check host, TLS, login and the start directory before saving. Tick *Save password / secret key* to keep the secret in the system keyring.
 - **S3:** choose protocol *S3* in the Site Manager and pick a provider preset (or leave the endpoint empty for AWS). Keys can also come from `~/.aws` profiles or the standard `AWS_*` environment variables.
 - **Transfers:** double‑click a file, drag files between the panes, or use the context menu. Folders are transferred recursively.
+- **Transfer settings** (menu *Transfer*): what to do when a file already exists, preserving timestamps, speed limits and the number of simultaneous transfers. With *Ask*, a dialog shows both files and lets you apply the choice to the rest of the session.
+- **SFTP extras:** one-time codes and other keyboard-interactive questions are asked in a dialog; host keys can be trusted for the current session only; dropped idle connections reconnect automatically.
 
 | Shortcut | Action |
 |---|---|
@@ -119,6 +123,8 @@ file-dermaga --endpoint http://localhost:9000 --path-style ls s3://
 | `sftp://[user[:pass]@]host[:port]/path` | SFTP over SSH (port 22) |
 | `davs://[user@]host[:port]/path` | WebDAV over HTTPS (`dav://` for plain HTTP) |
 | `s3://bucket/key` | S3 bucket and key (`s3://` alone lists buckets) |
+
+Transfer options: `--if-exists overwrite|newer|size|size-or-newer|resume|skip`, `-c/--continue` (resume), `--limit-rate <KiB/s>`, `-p/--preserve-time`, and `mv -f` to replace an existing target.
 
 Useful options: `-k/--insecure` (accept self‑signed certificates), `-v/--verbose` (protocol log), `--password` or `FILE_DERMAGA_PASSWORD`, for SFTP `-i/--key`, `--key-passphrase` (`FILE_DERMAGA_KEY_PASSPHRASE`) and `--accept-new-host-key`, and for S3 `--endpoint`/`FILE_DERMAGA_S3_ENDPOINT`, `--region`, `--profile`, `--path-style`, `--storage-class`, `--sse`, `--part-size`, `--concurrency`. Run `file-dermaga --help` for everything.
 
@@ -171,7 +177,6 @@ cargo deb -p file-dermaga-gui --no-build
 
 ## Roadmap
 
-- Resuming interrupted transfers
 - Multiple connections in tabs
 - Folder comparison and synchronisation
 - Packages for other distributions, macOS and Windows

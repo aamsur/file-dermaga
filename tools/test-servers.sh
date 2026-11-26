@@ -8,6 +8,7 @@
 # FTP  (plaintext):     ftp://test@127.0.0.1:2122/              password: test123
 # SFTP:                 sftp://test@127.0.0.1:2222/             password: test123
 #                       or key: -i ~/.cache/file-dermaga-test-servers/id_ed25519
+# SFTP (keyboard-interactive only, like OTP servers): sftp://test@127.0.0.1:2223/  password: test123
 # WebDAV (HTTP):        dav://test@127.0.0.1:8088/dav/          password: test123
 # WebDAV (HTTPS):       davs://test@127.0.0.1:8443/dav/         password: test123 (use -k)
 # WebDAV (Digest auth): dav://test@127.0.0.1:8089/dav/          password: test123
@@ -96,6 +97,8 @@ EOF
         useradd -m -s /bin/bash test && echo test:test123 | chpasswd &&
         mkdir -p /run/sshd /home/test/.ssh && cp /srv/id_ed25519.pub /home/test/.ssh/authorized_keys &&
         chown -R test:test /home/test/.ssh && chmod 700 /home/test/.ssh && chmod 600 /home/test/.ssh/authorized_keys &&
+        /usr/sbin/sshd -p 2223 -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=yes -o UsePAM=yes -o PubkeyAuthentication=no -o PidFile=/run/sshd-2223.pid &&
         exec /usr/sbin/sshd -D -e -p 2222 -o ListenAddress=127.0.0.1 -o PasswordAuthentication=yes'
     run_unless_open 8088 file-dermaga-test-dav -v "$DIR:/srv:ro" -v "$DIR/dav:/davroot" python:3.13-slim \
         sh -c "pip install -q wsgidav cheroot; wsgidav -c /srv/wsgidav-8088.yaml & exec wsgidav -c /srv/wsgidav-8443.yaml"

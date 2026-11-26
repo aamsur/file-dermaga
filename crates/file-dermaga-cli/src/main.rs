@@ -10,7 +10,7 @@ use file_dermaga_core::DirEntry;
 use file_dermaga_ftp::{FtpClient, FtpConfig, Security};
 use file_dermaga_transfer::{always, basename, join, parent, safe_name, Backend, Decision, Event, ExistsAction, Outcome, TransferOpts};
 use file_dermaga_s3::{S3Client, S3Config, UploadOptions};
-use file_dermaga_sftp::{SftpClient, SftpConfig};
+use file_dermaga_sftp::{KbdRequest, SftpClient, SftpConfig};
 use file_dermaga_webdav::{WebdavClient, WebdavConfig};
 use percent_encoding::percent_decode_str;
 
@@ -215,6 +215,32 @@ fn parse_target(s: &str, opts: &Opts) -> Result<Target> {
         cfg.timeout = Duration::from_secs(opts.timeout);
         if opts.verbose {
             cfg.status = Some(std::sync::Arc::new(|m: &str| eprintln!("   Status: {m}")));
+        }
+        if std::io::stdin().is_terminal() {
+            cfg.prompter = Some(std::sync::Arc::new(|req: KbdRequest| {
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || {
+                        if !req.instructions.is_empty() {
+                            eprintln!("{}", req.instructions);
+                        }
+                        let mut answers = Vec::new();
+                        for (text, echo) in req.prompts {
+                            if echo {
+                                eprint!("{text}");
+                                let mut line = String::new();
+                                std::io::stdin().read_line(&mut line).ok()?;
+                                answers.push(line.trim_end_matches(['\r', '\n']).to_owned());
+                            } else {
+                                answers.push(rpassword::prompt_password(text).ok()?);
+                            }
+                        }
+                        Some(answers)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                })
+            }));
         }
         return Ok(Target::Sftp(cfg, path));
     }
