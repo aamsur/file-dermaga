@@ -14,8 +14,15 @@ use file_dermaga_sftp::{KbdRequest, SftpClient, SftpConfig};
 use file_dermaga_webdav::{WebdavClient, WebdavConfig};
 use percent_encoding::percent_decode_str;
 
+/// Release builds get the git tag through `FILE_DERMAGA_VERSION` (set by
+/// .github/workflows/release.yml); local builds use the Cargo.toml version.
+const APP_VERSION: &str = match option_env!("FILE_DERMAGA_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "file-dermaga", version, about = "FTP, FTPS and S3 client")]
+#[command(name = "file-dermaga", version = APP_VERSION, about = "FTP, FTPS and S3 client")]
 #[command(after_help = "\
 URLs:
   ftp://[user[:pass]@]host[:port]/path    FTP, upgrades to TLS when offered

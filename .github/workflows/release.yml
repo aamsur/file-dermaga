@@ -37,6 +37,13 @@ jobs:
 
       - name: Build release binaries
         run: |
+          # Embed the release tag (v0.1.2 -> 0.1.2) so Help > About and
+          # `file-dermaga --version` match the published release, even when
+          # Cargo.toml was not bumped. Manual runs keep the Cargo.toml version.
+          if [ "${{ github.event_name }}" = "release" ]; then
+            export FILE_DERMAGA_VERSION="${GITHUB_REF_NAME#v}"
+            echo "Embedding version $FILE_DERMAGA_VERSION"
+          fi
           cargo build --release --locked -p file-dermaga-cli
           cargo build --release --locked -p file-dermaga-gui --features custom-protocol
 

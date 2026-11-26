@@ -1928,11 +1928,36 @@ const COMMANDS = {
     for (const p of Object.values(panes)) if (p.path) p.refresh();
   },
   quit: () => appWindow().close(),
-  about: () =>
-    alertDlg(
+  about: async () => {
+    const info = await invoke("app_info").catch(() => ({ version: "unknown", homepage: "https://github.com/aamsur/file-dermaga" }));
+    const link = el(
+      "a",
+      {
+        href: info.homepage,
+        onclick: (e) => {
+          e.preventDefault();
+          invoke("open_homepage").catch((err) => log("error", errText(err)));
+        },
+      },
+      info.homepage,
+    );
+    return dialog(
       "About FileDermaga",
-      "FileDermaga 0.1.0\n\nFTP, FTPS, SFTP, WebDAV and S3 client written in Rust.\nLicensed under the MIT License or the Apache License 2.0, at your option.\nThird-party licenses: /usr/share/doc/file-dermaga/THIRD-PARTY-LICENSES.html",
-    ),
+      el(
+        "div",
+        {},
+        el("p", { class: "about-version" }, `FileDermaga ${info.version}`),
+        el("p", {}, "FTP, FTPS, SFTP, WebDAV and S3 client written in Rust."),
+        el("p", {}, "Homepage: ", link),
+        el(
+          "p",
+          {},
+          "Licensed under the MIT License or the Apache License 2.0, at your option.\nThird-party licenses: /usr/share/doc/file-dermaga/THIRD-PARTY-LICENSES.html",
+        ),
+      ),
+      [{ label: "OK", value: true, primary: true }],
+    );
+  },
 };
 
 const MENUS = {

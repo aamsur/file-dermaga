@@ -263,6 +263,8 @@ table.grid .num { text-align: right; }
 .dialog h2 { font-size: 14px; margin: 0; padding: 12px 16px 6px; }
 .dialog .body { padding: 8px 16px; overflow: auto; }
 .dialog .body p { margin: 4px 0 10px; white-space: pre-wrap; user-select: text; -webkit-user-select: text; word-break: break-word; }
+.dialog .body a { color: var(--focus); text-decoration: underline; cursor: pointer; }
+.dialog .body .about-version { font-weight: 600; font-size: 1.1em; }
 .dialog .body input.full { width: 100%; }
 .dialog .actions { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px 14px; }
 

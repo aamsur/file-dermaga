@@ -1442,6 +1442,44 @@ fn path_basename(path: String) -> String {
     basename(&path).to_owned()
 }
 
+/// Version shown in Help > About. Release builds get the git tag through
+/// `FILE_DERMAGA_VERSION` (set by .github/workflows/release.yml); local builds
+/// fall back to the workspace version in Cargo.toml.
+const APP_VERSION: &str = match option_env!("FILE_DERMAGA_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+const HOMEPAGE: &str = env!("CARGO_PKG_REPOSITORY");
+
+#[derive(Serialize)]
+struct AppInfo {
+    version: &'static str,
+    homepage: &'static str,
+}
+
+#[tauri::command]
+fn app_info() -> AppInfo {
+    AppInfo { version: APP_VERSION, homepage: HOMEPAGE }
+}
+
+/// Opens the project homepage in the default browser. Takes no URL from the
+/// UI on purpose, so the frontend cannot make it launch arbitrary targets.
+#[tauri::command]
+fn open_homepage() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    let mut child = cmd.arg(HOMEPAGE).spawn().map_err(|e| format!("could not open browser: {e}"))?;
+    // Reap the launcher so it does not linger as a zombie process.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 #[cfg(debug_assertions)]
 #[tauri::command]
 fn selftest_report(app: AppHandle, ok: bool, report: String) {
@@ -1506,6 +1544,8 @@ fn main() {
             site_secret_set,
             path_join,
             path_basename,
+            app_info,
+            open_homepage,
             selftest_report,
         ])
         .run(tauri::generate_context!())
