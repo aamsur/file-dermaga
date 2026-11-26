@@ -4,6 +4,7 @@ description = "Backend-neutral file operations and recursive transfers for FileD
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 file-dermaga-core.workspace = true

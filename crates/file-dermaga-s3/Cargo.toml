@@ -4,6 +4,7 @@ description = "Amazon S3 and S3-compatible storage backend for FileDermaga"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 file-dermaga-core.workspace = true
