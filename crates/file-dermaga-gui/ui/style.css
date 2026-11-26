@@ -97,12 +97,25 @@ button:hover { background: var(--hover); }
 button:disabled { opacity: .5; }
 button.primary { background: var(--sel); color: var(--sel-fg); border-color: var(--sel); }
 
+/* Named areas: hiding a panel (display: none) must not shift the others
+   into its row, so every part is pinned to its own area. */
 #app {
   height: 100vh;
   display: grid;
   grid-template-rows: auto auto auto var(--log-h) 5px 1fr 5px var(--queue-h) auto auto;
   grid-template-columns: 100%;
+  grid-template-areas: "menu" "toolbar" "quick" "log" "logsplit" "panes" "queuesplit" "queue" "tabs" "status";
 }
+#menubar { grid-area: menu; }
+#toolbar { grid-area: toolbar; }
+#quickconnect { grid-area: quick; }
+#log { grid-area: log; }
+.splitter[data-target="log"] { grid-area: logsplit; }
+#panes { grid-area: panes; }
+.splitter[data-target="queue"] { grid-area: queuesplit; }
+#queue { grid-area: queue; }
+#queue-tabs { grid-area: tabs; }
+#statusbar { grid-area: status; }
 #app.no-log { grid-template-rows: auto auto auto 0 0 1fr 5px var(--queue-h) auto auto; }
 #app.no-queue { grid-template-rows: auto auto auto var(--log-h) 5px 1fr 0 0 0 auto; }
 #app.no-log.no-queue { grid-template-rows: auto auto auto 0 0 1fr 0 0 0 auto; }
@@ -169,7 +182,18 @@ button.primary { background: var(--sel); color: var(--sel-fg); border-color: var
 
 /* Panes */
 #panes { display: grid; grid-template-columns: var(--left-w) 5px 1fr; min-height: 0; }
-.side { display: grid; grid-template-rows: auto var(--tree-h) 5px 1fr auto; min-height: 0; min-width: 0; }
+.side {
+  display: grid;
+  grid-template-rows: auto var(--tree-h) 5px 1fr auto;
+  grid-template-areas: "path" "tree" "treesplit" "list" "status";
+  min-height: 0;
+  min-width: 0;
+}
+.side .pathbar { grid-area: path; }
+.side .tree { grid-area: tree; }
+.side .splitter.inner { grid-area: treesplit; }
+.side .list { grid-area: list; }
+.side .statusline { grid-area: status; }
 .side.no-tree { grid-template-rows: auto 0 0 1fr auto; }
 .side.no-tree .tree, .side.no-tree .splitter.inner { display: none; }
 .pathbar { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: var(--panel); border: 1px solid var(--border); border-bottom: 0; }
@@ -258,8 +282,9 @@ table.grid .num { text-align: right; }
 .sm form .row input[name=port] { width: 70px; }
 .sm form h3 { grid-column: 1 / -1; margin: 8px 0 0; font-size: 13px; border-bottom: 1px solid var(--border-soft); padding-bottom: 3px; }
 .sm form .check { display: flex; align-items: center; gap: 6px; }
-.sm .s3-only, .sm .ftp-only { display: contents; }
+.sm .s3-only, .sm .ftp-only, .sm .sftp-only, .sm .dav-only, .sm .tls-only { display: contents; }
 .sm.proto-s3 .ftp-only, .sm:not(.proto-s3) .s3-only { display: none; }
+.sm:not(.proto-sftp) .sftp-only, .sm:not(.proto-dav) .dav-only, .sm.proto-sftp .tls-only { display: none; }
 
 /* Toolbar split button: Site Manager + saved-sites dropdown */
 .tb-split { display: inline-flex; }
@@ -282,3 +307,7 @@ table.grid .num { text-align: right; }
 .test-result details { margin-top: 6px; }
 .test-result pre { max-height: 160px; overflow: auto; font-size: 11.5px; margin: 4px 0 0; padding: 6px; background: var(--bg); border-radius: 4px; }
 .test-result button { margin-top: 8px; }
+
+/* Small icon button inside a path bar (e.g. Home) */
+.pathbtn { width: 28px; height: 26px; padding: 2px; display: grid; place-items: center; flex: none; }
+.pathbtn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }

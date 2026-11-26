@@ -2,11 +2,11 @@
 Type=Application
 Name=FileDermaga
 GenericName=File Transfer Client
-Comment=Transfer files over FTP, FTPS and Amazon S3 compatible storage
+Comment=Transfer files over FTP, FTPS, SFTP, WebDAV and Amazon S3 compatible storage
 Exec=file-dermaga-gui
 Icon=file-dermaga
 Terminal=false
 Categories=Network;FileTransfer;
-Keywords=ftp;ftps;s3;transfer;upload;download;backup;
+Keywords=ftp;ftps;sftp;ssh;webdav;nextcloud;s3;transfer;upload;download;backup;
 StartupNotify=true
 StartupWMClass=file-dermaga-gui

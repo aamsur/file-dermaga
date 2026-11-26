@@ -1,6 +1,6 @@
 # FileDermaga
 
-**FileDermaga** is a fast, native file transfer client for **FTP, FTPS and Amazon S3 compatible storage**, written in Rust. It comes as a desktop app with a classic two‑pane layout and as a scriptable command line tool.
+**FileDermaga** is a fast, native file transfer client for **FTP, FTPS, SFTP, WebDAV and Amazon S3 compatible storage**, written in Rust. It comes as a desktop app with a classic two‑pane layout and as a scriptable command line tool.
 
 *Dermaga* is Indonesian for *pier* — the place where cargo moves between land and ship. FileDermaga does the same for your files: between your computer, your servers and your buckets.
 
@@ -10,6 +10,8 @@
 
 **Protocols**
 - FTP with automatic TLS upgrade, explicit FTPS (`AUTH TLS`) and implicit FTPS (port 990)
+- SFTP (SSH): password, keyboard-interactive, key file (OpenSSH, PEM or PuTTY `.ppk`, passphrase prompted when needed) or ssh-agent login; host keys verified against `~/.ssh/known_hosts`
+- WebDAV over HTTPS or HTTP with Basic or Digest authentication: Nextcloud, ownCloud, Synology, Apache/nginx WebDAV and others
 - Amazon S3 and S3‑compatible services: Backblaze B2, Cloudflare R2, Wasabi, DigitalOcean Spaces, MinIO, …
 - Understands the directory listing formats of a wide range of servers: Unix, Windows/IIS, MLSD, EPLF, OpenVMS, IBM i, z/OS, z/VM, OS/2, VxWorks, HP NonStop and more
 
@@ -64,7 +66,8 @@ A Rust toolchain ≥ 1.85 is required ([rustup.rs](https://rustup.rs)).
 
 ## Using the desktop app
 
-- **Quickconnect:** type a host such as `ftp.example.com`, `ftpes://ftp.example.com` or `ftps://…`, plus user name, password and port.
+- **Quickconnect:** type a host such as `ftp.example.com`, `ftpes://…`, `ftps://…`, `sftp://server.example.com` or `davs://cloud.example.com/remote.php/dav/files/alice`, plus user name, password and port.
+- **SFTP:** the first connection to a server shows its host key fingerprint; once trusted it is stored in `~/.ssh/known_hosts`, and a changed key is refused. Without a password, FileDermaga tries the key file from the Site Manager, the ssh-agent and the default keys in `~/.ssh`.
 - **Site Manager** (`Ctrl+S`): save connections, then pick them from the **▾** next to the Site Manager button. Use **Test connection** to check host, TLS, login and the start directory before saving. Tick *Save password / secret key* to keep the secret in the system keyring.
 - **S3:** choose protocol *S3* in the Site Manager and pick a provider preset (or leave the endpoint empty for AWS). Keys can also come from `~/.aws` profiles or the standard `AWS_*` environment variables.
 - **Transfers:** double‑click a file, drag files between the panes, or use the context menu. Folders are transferred recursively.
@@ -89,6 +92,15 @@ file-dermaga ls -l ftp://user@ftp.example.com/public_html      # asks for the pa
 file-dermaga put -r ./site ftpes://user@ftp.example.com/www/   # explicit TLS required
 file-dermaga get ftps://user@ftp.example.com/backup.tar.gz     # implicit TLS (port 990)
 
+# SFTP
+file-dermaga ls -l sftp://user@server.example.com/var/www       # ssh-agent / ~/.ssh keys, else asks for the password
+file-dermaga -i ~/.ssh/deploy_key put -r ./site sftp://deploy@server.example.com/var/www/
+file-dermaga --accept-new-host-key ls sftp://user@new-server.example.com/   # first connection to a new host
+
+# WebDAV
+file-dermaga ls -l davs://alice@cloud.example.com/remote.php/dav/files/alice/
+file-dermaga put report.pdf davs://alice@cloud.example.com/remote.php/dav/files/alice/Documents/
+
 # Amazon S3
 file-dermaga ls s3://                                          # list buckets
 file-dermaga put --storage-class STANDARD_IA --sse AES256 report.pdf s3://my-bucket/reports/
@@ -104,12 +116,15 @@ file-dermaga --endpoint http://localhost:9000 --path-style ls s3://
 | `ftp://[user[:pass]@]host[:port]/path` | FTP, upgraded to TLS when the server offers it (`--plain` to disable) |
 | `ftpes://user@host/path` | FTP with explicit TLS required |
 | `ftps://user@host/path` | FTP with implicit TLS (port 990) |
+| `sftp://[user[:pass]@]host[:port]/path` | SFTP over SSH (port 22) |
+| `davs://[user@]host[:port]/path` | WebDAV over HTTPS (`dav://` for plain HTTP) |
 | `s3://bucket/key` | S3 bucket and key (`s3://` alone lists buckets) |
 
-Useful options: `-k/--insecure` (accept self‑signed certificates), `-v/--verbose` (protocol log), `--password` or `FILE_DERMAGA_PASSWORD`, and for S3 `--endpoint`/`FILE_DERMAGA_S3_ENDPOINT`, `--region`, `--profile`, `--path-style`, `--storage-class`, `--sse`, `--part-size`, `--concurrency`. Run `file-dermaga --help` for everything.
+Useful options: `-k/--insecure` (accept self‑signed certificates), `-v/--verbose` (protocol log), `--password` or `FILE_DERMAGA_PASSWORD`, for SFTP `-i/--key`, `--key-passphrase` (`FILE_DERMAGA_KEY_PASSPHRASE`) and `--accept-new-host-key`, and for S3 `--endpoint`/`FILE_DERMAGA_S3_ENDPOINT`, `--region`, `--profile`, `--path-style`, `--storage-class`, `--sse`, `--part-size`, `--concurrency`. Run `file-dermaga --help` for everything.
 
 ## Security notes
 
+- SFTP host keys are verified against `~/.ssh/known_hosts` like OpenSSH: unknown hosts need explicit confirmation, changed keys are always refused.
 - TLS certificates are verified against the Mozilla root store. Accepting an untrusted certificate is an explicit choice (`-k` on the command line, a confirmation dialog in the app).
 - With plain `ftp://`, FileDermaga upgrades to TLS whenever the server supports it and warns when the connection stays unencrypted.
 - Saved passwords and secret keys live in the operating system keyring. The site list (`~/.config/app.file-dermaga.client/sites.json`) never contains secrets.
@@ -121,6 +136,8 @@ crates/
   file-dermaga-core      timestamps, directory entries, listing parser (see SPEC.md)
   file-dermaga-ftp       async FTP/FTPS client (tokio + rustls)
   file-dermaga-s3        S3 backend (AWS SDK)
+  file-dermaga-sftp      SFTP client (russh)
+  file-dermaga-webdav    WebDAV client (reqwest)
   file-dermaga-transfer  backend-neutral operations and recursive transfers
   file-dermaga-cli       `file-dermaga` command line tool
   file-dermaga-gui       desktop app (Tauri 2, plain HTML/CSS/JS front end)
@@ -135,7 +152,7 @@ tools/test-servers.sh start            # local FTPS/FTP/S3 servers in Docker for
 tools/test-servers.sh stop
 ```
 
-`tools/test-servers.sh` starts an FTPS server on port 2121, a plain FTP server on 2122 (user `test`, password `test123`) and an S3 emulator on `http://127.0.0.1:9100`.
+`tools/test-servers.sh` starts, all with user `test` / password `test123`: FTPS on port 2121, plain FTP on 2122, SFTP on 2222 (also accepts the generated key `~/.cache/file-dermaga-test-servers/id_ed25519`), WebDAV on `http://127.0.0.1:8088/dav/` and `https://127.0.0.1:8443/dav/`, plus an S3 emulator on `http://127.0.0.1:9100`.
 
 ### Releasing
 
@@ -154,7 +171,6 @@ cargo deb -p file-dermaga-gui --no-build
 
 ## Roadmap
 
-- SFTP
 - Resuming interrupted transfers
 - Multiple connections in tabs
 - Folder comparison and synchronisation

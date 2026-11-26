@@ -146,6 +146,8 @@ async function loadSites() {
 
 function siteSubtitle(s) {
   if (s.protocol === "s3") return s.endpoint ? s.endpoint.replace(/^https?:\/\//, "") : "Amazon S3";
+  if (s.protocol === "dav" || s.protocol === "davs") return `${s.protocol}://${s.user ? s.user + "@" : ""}${s.host}${s.port ? ":" + s.port : ""}${s.basePath || ""}`;
+  if (s.protocol === "sftp") return `sftp://${s.user ? s.user + "@" : ""}${s.host}${s.port ? ":" + s.port : ""}`;
   return `${s.user ? s.user + "@" : ""}${s.host}${s.port ? ":" + s.port : ""}`;
 }
 
@@ -1187,7 +1189,8 @@ function setTitle(text) {
 }
 
 function needsPassword(site) {
-  return site.protocol !== "s3" && site.user && site.user !== "anonymous" && !site.password && !site.passwordSaved;
+  if (site.protocol === "s3" || site.protocol === "sftp") return false;
+  return site.user && site.user !== "anonymous" && !site.password && !site.passwordSaved;
 }
 
 /** After a successful connect, keep a password that was typed into the
@@ -1227,6 +1230,45 @@ async function connect(site) {
     info = await invoke("connect", { site });
   } catch (e) {
     const msg = errText(e);
+    const keyMsg = msg.match(/^KEY_(PASSPHRASE_NEEDED|LOAD_FAILED) (.+?): /);
+    if (keyMsg && (keyMsg[1] === "PASSPHRASE_NEEDED" || /passphrase/.test(msg))) {
+      const retry = keyMsg[1] === "LOAD_FAILED";
+      const pp = await promptDlg(
+        "Key passphrase",
+        `${retry ? "Wrong passphrase. " : ""}The private key ${keyMsg[2]} is protected by a passphrase. Enter it:`,
+        "",
+        { password: true },
+      );
+      setConnState("Not connected");
+      if (pp === null) return false;
+      const ok = await connect({ ...site, keyPassphrase: pp });
+      if (ok) rememberSecret(site, "passphrase", pp);
+      return ok;
+    }
+    if (msg.startsWith("UNKNOWN_HOST_KEY ")) {
+      const fp = msg.split(/\s+/)[1];
+      const ok = await confirmDlg(
+        "Unknown host key",
+        `This is the first connection to ${site.host}. The server identifies itself with the host key fingerprint\n\n${fp}\n\n` +
+          "Only trust it if it matches the fingerprint given by the server administrator. It will be saved to ~/.ssh/known_hosts.",
+        "Trust and connect",
+      );
+      setConnState("Not connected");
+      return ok ? connect({ ...site, trustHostKey: fp }) : false;
+    }
+    if (msg.startsWith("HOST_KEY_CHANGED ")) {
+      alertDlg("WARNING: host key changed", msg);
+      setConnState("Not connected");
+      return false;
+    }
+    if (site.protocol === "sftp" && /authentication failed/.test(msg) && !site.password) {
+      const pw = await promptDlg("Enter password", `Key and ssh-agent login failed. Password for ${site.user || "your user"}@${site.host}:`, "", { password: true });
+      setConnState("Not connected");
+      if (pw === null) return false;
+      const ok = await connect({ ...site, password: pw });
+      if (ok) rememberSecret(site, "password", pw);
+      return ok;
+    }
     if (CERT_ERROR.test(msg) && !site.insecure) {
       const ok = await confirmDlg(
         "Unknown certificate",
@@ -1298,7 +1340,9 @@ function quickSite() {
     protocol = m[1].toLowerCase();
     host = m[2].replace(/\/+$/, "");
   }
+  protocol = { webdav: "dav", webdavs: "davs", http: "dav", https: "davs" }[protocol] || protocol;
   if (port === 990 && protocol === "ftp") protocol = "ftps";
+  if (port === 22 && protocol === "ftp") protocol = "sftp";
   return { protocol, host, port, user, password };
 }
 
@@ -1342,6 +1386,9 @@ const PROTOCOLS = [
   ["ftpes", "FTP - Require explicit FTP over TLS"],
   ["ftps", "FTP - Require implicit FTP over TLS"],
   ["ftp-plain", "FTP - Only use plain FTP (insecure)"],
+  ["sftp", "SFTP - SSH File Transfer Protocol"],
+  ["davs", "WebDAV over HTTPS"],
+  ["dav", "WebDAV over HTTP (insecure)"],
   ["s3", "S3 - Amazon S3 / S3-compatible storage"],
 ];
 
@@ -1398,8 +1445,24 @@ async function siteManager() {
       ...field("Host:", el("div", { class: "row" }, inp("host", { placeholder: "ftp.example.com" }), el("span", {}, "Port:"), inp("port", { inputmode: "numeric" }))),
       ...field("User:", inp("user")),
       ...field("Password:", inp("password", { type: "password" })),
-      el("label", {}, ""),
-      el("label", { class: "check" }, el("input", { type: "checkbox", name: "insecure" }), "Accept invalid / self-signed certificates"),
+      el(
+        "div",
+        { class: "sftp-only" },
+        ...field("Key file:", inp("keyFile", { placeholder: "~/.ssh/id_ed25519 (empty: ssh-agent, then ~/.ssh keys)" })),
+        ...field("Key passphrase:", inp("keyPassphrase", { type: "password" })),
+        el("div", { class: "hint" }, "Password is optional when a key or ssh-agent is used. Host keys are checked against ~/.ssh/known_hosts."),
+      ),
+      el(
+        "div",
+        { class: "dav-only" },
+        ...field("WebDAV path:", inp("basePath", { placeholder: "e.g. /remote.php/dav/files/alice (Nextcloud)" })),
+      ),
+      el(
+        "div",
+        { class: "tls-only" },
+        el("label", {}, ""),
+        el("label", { class: "check" }, el("input", { type: "checkbox", name: "insecure" }), "Accept invalid / self-signed certificates"),
+      ),
     ),
     el(
       "div",
@@ -1463,6 +1526,21 @@ async function siteManager() {
       r.details.length ? el("ul", {}, r.details.map((d) => el("li", {}, d))) : null,
       r.transcript.length ? el("details", {}, el("summary", {}, "Show protocol log"), el("pre", {}, r.transcript.join("\n"))) : null,
     );
+    if (r.hostKey) {
+      box.append(
+        el(
+          "button",
+          {
+            type: "button",
+            onclick: () => {
+              sites[cur].trustHostKey = r.hostKey;
+              runTest();
+            },
+          },
+          "Trust this host key and test again",
+        ),
+      );
+    }
     if (r.certError) {
       box.append(
         el(
@@ -1481,6 +1559,14 @@ async function siteManager() {
     testOut.replaceChildren(box);
   };
   testBtn.addEventListener("click", runTest);
+
+  function applyProto() {
+    const v = proto.value;
+    root.classList.toggle("proto-s3", v === "s3");
+    root.classList.toggle("proto-sftp", v === "sftp");
+    root.classList.toggle("proto-dav", v === "dav" || v === "davs");
+    form.port.placeholder = { sftp: "22", dav: "80", davs: "443", ftps: "990" }[v] || "21";
+  }
 
   const read = () => {
     if (cur < 0) return;
@@ -1507,7 +1593,7 @@ async function siteManager() {
     form.secretKey.placeholder = saved;
     testOut.replaceChildren();
     preset.value = S3_PRESETS.some(([v]) => v === s.endpoint) ? s.endpoint : preset.value;
-    root.classList.toggle("proto-s3", proto.value === "s3");
+    applyProto();
   };
   const renderList = () => {
     listbox.replaceChildren(
@@ -1516,7 +1602,7 @@ async function siteManager() {
       ),
     );
   };
-  proto.addEventListener("change", () => root.classList.toggle("proto-s3", proto.value === "s3"));
+  proto.addEventListener("change", applyProto);
   preset.addEventListener("change", () => {
     form.endpoint.value = preset.value;
     form.pathStyle.checked = !!preset.value && !preset.value.includes("amazonaws");
@@ -1702,7 +1788,7 @@ const COMMANDS = {
   about: () =>
     alertDlg(
       "About FileDermaga",
-      "FileDermaga 0.1.0\n\nFTP, FTPS and S3 client written in Rust.\nLicensed under the MIT License or the Apache License 2.0, at your option.\nThird-party licenses: /usr/share/doc/file-dermaga/THIRD-PARTY-LICENSES.html",
+      "FileDermaga 0.1.0\n\nFTP, FTPS, SFTP, WebDAV and S3 client written in Rust.\nLicensed under the MIT License or the Apache License 2.0, at your option.\nThird-party licenses: /usr/share/doc/file-dermaga/THIRD-PARTY-LICENSES.html",
     ),
 };
 
@@ -1741,7 +1827,17 @@ const MENUS = {
   help: () => [{ label: "About FileDermaga", action: COMMANDS.about }],
 };
 
+async function goLocalHome() {
+  try {
+    await panes.local.navigate(await invoke("local_home"));
+    panes.local.listEl.focus();
+  } catch (e) {
+    log("error", errText(e));
+  }
+}
+
 function bindChrome() {
+  $("#local-home").addEventListener("click", goLocalHome);
   $("#toolbar").addEventListener("click", (e) => {
     const b = e.target.closest("[data-cmd]");
     if (b) COMMANDS[b.dataset.cmd]?.();
@@ -1781,6 +1877,9 @@ function bindChrome() {
     } else if (e.ctrlKey && k === "h") {
       e.preventDefault();
       COMMANDS["toggle-hidden"]();
+    } else if (e.altKey && e.key === "Home") {
+      e.preventDefault();
+      goLocalHome();
     } else if (e.key === "Escape") {
       closePopups();
     }

@@ -15,6 +15,8 @@ file-dermaga-core = { path = "crates/file-dermaga-core" }
 file-dermaga-ftp = { path = "crates/file-dermaga-ftp" }
 file-dermaga-s3 = { path = "crates/file-dermaga-s3" }
 file-dermaga-transfer = { path = "crates/file-dermaga-transfer" }
+file-dermaga-sftp = { path = "crates/file-dermaga-sftp" }
+file-dermaga-webdav = { path = "crates/file-dermaga-webdav" }
 
 anyhow = "1"
 thiserror = "2"

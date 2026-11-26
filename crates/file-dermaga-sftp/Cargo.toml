@@ -1,0 +1,14 @@
+[package]
+name = "file-dermaga-sftp"
+description = "SFTP (SSH File Transfer Protocol) client for FileDermaga"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+file-dermaga-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+russh = "0.65"
+russh-sftp = "4"

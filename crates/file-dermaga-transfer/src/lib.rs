@@ -1,6 +1,7 @@
 //! Backend-neutral file operations shared by the CLI and the GUI.
 //!
-//! Paths are strings: `/dir/file` for FTP, `bucket/key` for S3 (empty =
+//! Paths are strings: `/dir/file` for FTP, SFTP and WebDAV (WebDAV paths
+//! are relative to the server's base URL), `bucket/key` for S3 (empty =
 //! bucket list).
 
 use std::path::{Path, PathBuf};
@@ -9,11 +10,15 @@ use anyhow::{bail, Context, Result};
 use file_dermaga_core::DirEntry;
 use file_dermaga_ftp::FtpClient;
 use file_dermaga_s3::S3Client;
+use file_dermaga_sftp::SftpClient;
+use file_dermaga_webdav::WebdavClient;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 pub enum Backend {
     Ftp(FtpClient),
     S3(S3Client),
+    Sftp(SftpClient),
+    Webdav(WebdavClient),
 }
 
 /// Progress of a (possibly recursive) transfer.
@@ -63,6 +68,8 @@ impl Backend {
         let mut entries = match self {
             Backend::Ftp(c) => c.list(path).await?.entries,
             Backend::S3(c) => c.list(path).await?,
+            Backend::Sftp(c) => c.list(path).await?,
+            Backend::Webdav(c) => c.list(path).await?,
         };
         entries.sort_by(|a, b| b.is_dir().cmp(&a.is_dir()).then_with(|| a.name.cmp(&b.name)));
         Ok(entries)
@@ -75,6 +82,8 @@ impl Backend {
                 let (_, key) = file_dermaga_s3::split(path);
                 key.is_empty() || key.ends_with('/')
             }
+            Backend::Sftp(c) => c.is_dir(path).await?,
+            Backend::Webdav(c) => c.is_dir(path).await?,
         })
     }
 
@@ -85,6 +94,8 @@ impl Backend {
             let n = match self {
                 Backend::Ftp(c) => c.retrieve(path, &mut out, &mut *progress).await?,
                 Backend::S3(c) => c.download(path, &mut out, &mut *progress).await?,
+                Backend::Sftp(c) => c.download(path, &mut out, &mut *progress).await?,
+                Backend::Webdav(c) => c.download(path, &mut out, &mut *progress).await?,
             };
             out.shutdown().await?;
             Ok::<_, anyhow::Error>(n)
@@ -103,6 +114,15 @@ impl Backend {
                 c.store(path, &mut input, &mut *progress).await.map_err(Into::into)
             }
             Backend::S3(c) => c.upload(local, path, &mut *progress).await,
+            Backend::Sftp(c) => {
+                let mut input = tokio::fs::File::open(local).await?;
+                c.upload(path, &mut input, &mut *progress).await
+            }
+            Backend::Webdav(c) => {
+                let input = tokio::fs::File::open(local).await?;
+                let size = input.metadata().await?.len();
+                c.upload(path, input, size, &mut *progress).await
+            }
         };
         res.with_context(|| format!("uploading {}", local.display()))
     }
@@ -111,6 +131,8 @@ impl Backend {
         match self {
             Backend::Ftp(c) => Ok(c.mkdir(path).await?),
             Backend::S3(c) => c.mkdir(path).await,
+            Backend::Sftp(c) => c.mkdir(path).await,
+            Backend::Webdav(c) => c.mkdir(path).await,
         }
     }
 
@@ -140,6 +162,8 @@ impl Backend {
         match self {
             Backend::Ftp(c) => Ok(c.delete(path).await?),
             Backend::S3(c) => c.delete(path).await,
+            Backend::Sftp(c) => c.delete(path).await,
+            Backend::Webdav(c) => c.delete(path).await,
         }
     }
 
@@ -148,6 +172,9 @@ impl Backend {
             Backend::Ftp(c) if recursive => Ok(c.remove_recursive(path).await?),
             Backend::Ftp(c) => Ok(c.rmdir(path).await?),
             Backend::S3(c) => c.rmdir(path, recursive).await,
+            Backend::Sftp(c) if recursive => c.remove_recursive(path).await,
+            Backend::Sftp(c) => c.rmdir(path).await,
+            Backend::Webdav(c) => c.rmdir(path, recursive).await,
         }
     }
 
@@ -155,12 +182,28 @@ impl Backend {
         match self {
             Backend::Ftp(c) => Ok(c.rename(from, to).await?),
             Backend::S3(c) => c.rename(from, to).await,
+            Backend::Sftp(c) => c.rename(from, to).await,
+            Backend::Webdav(c) => c.rename(from, to).await,
+        }
+    }
+
+    /// Change permissions; `mode` is octal like "644" (FTP and SFTP only).
+    pub async fn chmod(&mut self, path: &str, mode: &str) -> Result<()> {
+        match self {
+            Backend::Ftp(c) => Ok(c.chmod(path, mode).await?),
+            Backend::Sftp(c) => c.chmod(path, mode).await,
+            Backend::S3(_) => bail!("S3 has no file permissions"),
+            Backend::Webdav(_) => bail!("WebDAV has no file permissions"),
         }
     }
 
     pub async fn close(self) {
-        if let Backend::Ftp(c) = self {
-            let _ = c.quit().await;
+        match self {
+            Backend::Ftp(c) => {
+                let _ = c.quit().await;
+            }
+            Backend::Sftp(c) => c.close().await,
+            Backend::S3(_) | Backend::Webdav(_) => {}
         }
     }
 

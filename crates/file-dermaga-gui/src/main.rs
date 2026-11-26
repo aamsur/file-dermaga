@@ -15,6 +15,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use file_dermaga_core::{Accuracy, DirEntry};
 use file_dermaga_ftp::{FtpClient, FtpConfig, LogKind, Logger, Security};
 use file_dermaga_s3::{S3Client, S3Config, UploadOptions};
+use file_dermaga_sftp::{SftpClient, SftpConfig};
+use file_dermaga_webdav::{WebdavClient, WebdavConfig};
 use file_dermaga_transfer::{basename, Backend, Event};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -64,6 +66,18 @@ struct Site {
     sse: String,
     remote_dir: String,
     local_dir: String,
+    // SFTP
+    /// Private key file; empty = ssh-agent, then ~/.ssh/id_*.
+    key_file: String,
+    #[serde(skip_serializing)]
+    key_passphrase: String,
+    /// Fingerprint the user just accepted for an unknown SSH host (not saved;
+    /// accepted keys go to ~/.ssh/known_hosts).
+    #[serde(skip_serializing)]
+    trust_host_key: String,
+    // WebDAV
+    /// Path of the WebDAV root on the server, e.g. /remote.php/dav/files/alice
+    base_path: String,
     /// Keep the password / secret key in the OS keyring.
     save_password: bool,
     /// Output only: a secret for this site is in the keyring.
@@ -146,6 +160,8 @@ struct TransferEvent {
 enum Kind {
     Ftp(FtpConfig),
     S3(S3Client),
+    Sftp(SftpConfig),
+    Webdav(WebdavClient),
 }
 
 struct Session {
@@ -160,6 +176,8 @@ impl Session {
         Ok(match &self.kind {
             Kind::Ftp(cfg) => Backend::Ftp(FtpClient::connect(cfg).await?),
             Kind::S3(c) => Backend::S3(c.clone()),
+            Kind::Sftp(cfg) => Backend::Sftp(SftpClient::connect(cfg).await?),
+            Kind::Webdav(c) => Backend::Webdav(c.clone()),
         })
     }
 }
@@ -189,11 +207,27 @@ fn log(app: &AppHandle, kind: &'static str, text: impl Into<String>) {
 /// Accepts `host`, `host:port` or `scheme://host[:port]` in the host field.
 fn split_host(site: &mut Site) {
     if let Some((scheme, rest)) = site.host.split_once("://") {
-        site.protocol = scheme.to_ascii_lowercase();
+        site.protocol = match scheme.to_ascii_lowercase().as_str() {
+            "webdavs" | "https" => "davs".into(),
+            "webdav" | "http" => "dav".into(),
+            other => other.into(),
+        };
         site.host = rest.trim_end_matches('/').to_owned();
     }
     if site.protocol == "s3" {
         return;
+    }
+    // A path after the host: WebDAV root, or the start directory.
+    if let Some(i) = site.host.find('/') {
+        let path = site.host[i..].to_owned();
+        site.host.truncate(i);
+        if is_webdav(&site.protocol) {
+            if site.base_path.is_empty() {
+                site.base_path = path;
+            }
+        } else if site.remote_dir.is_empty() {
+            site.remote_dir = path;
+        }
     }
     if let Some((h, p)) = site.host.rsplit_once(':') {
         if let Ok(port) = p.parse() {
@@ -213,6 +247,7 @@ const LEGACY_KEYRING_SERVICE: &str = "gojjira";
 const LEGACY_CONFIG_DIR: &str = "app.gojjira.client";
 const SECRET_PASSWORD: &str = "password";
 const SECRET_S3: &str = "secret";
+const SECRET_PASSPHRASE: &str = "passphrase";
 
 fn keyring_entry(id: &str, kind: &str) -> keyring::Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, &format!("{id}/{kind}"))
@@ -277,6 +312,11 @@ fn fill_secrets(site: &mut Site) {
             site.secret_key = p;
         }
     }
+    if site.key_passphrase.is_empty() && !site.key_file.is_empty() {
+        if let Some(p) = secret_get(&site.id, SECRET_PASSPHRASE) {
+            site.key_passphrase = p;
+        }
+    }
 }
 
 /// Keyring access talks D-Bus; keep it off the async runtime threads.
@@ -307,6 +347,46 @@ fn s3_config_of(site: &Site) -> S3Config {
     }
 }
 
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+fn sftp_config_of(site: &Site) -> CmdResult<SftpConfig> {
+    if site.host.is_empty() {
+        return Err("Host is empty".into());
+    }
+    let mut cfg = SftpConfig::new(site.host.clone());
+    cfg.port = site.port.unwrap_or(22);
+    cfg.user = site.user.clone();
+    cfg.password = site.password.clone();
+    cfg.key_file = opt(&site.key_file).map(|p| expand_home(&p));
+    cfg.key_passphrase = (!site.key_passphrase.is_empty()).then(|| site.key_passphrase.clone());
+    cfg.trust_fingerprint = opt(&site.trust_host_key);
+    Ok(cfg)
+}
+
+fn is_webdav(protocol: &str) -> bool {
+    matches!(protocol, "dav" | "davs")
+}
+
+fn webdav_config_of(site: &Site) -> CmdResult<WebdavConfig> {
+    if site.host.is_empty() {
+        return Err("Host is empty".into());
+    }
+    let scheme = if site.protocol == "davs" { "https" } else { "http" };
+    let port = site.port.map(|p| format!(":{p}")).unwrap_or_default();
+    let base = site.base_path.trim().trim_matches('/');
+    let url = if base.is_empty() { format!("{scheme}://{}{port}/", site.host) } else { format!("{scheme}://{}{port}/{base}/", site.host) };
+    let mut cfg = WebdavConfig::new(&url).map_err(err_chain)?;
+    cfg.user = site.user.clone();
+    cfg.password = site.password.clone();
+    cfg.accept_invalid_certs = site.insecure;
+    Ok(cfg)
+}
+
 fn security_of(protocol: &str) -> (Security, u16) {
     match protocol {
         "ftpes" => (Security::ExplicitTls, 21),
@@ -317,6 +397,9 @@ fn security_of(protocol: &str) -> (Security, u16) {
 }
 
 fn ftp_config_of(site: &Site, logger: Option<Logger>) -> CmdResult<FtpConfig> {
+    if !matches!(site.protocol.as_str(), "" | "ftp" | "ftpes" | "ftps" | "ftp-plain") {
+        return Err(format!("Unsupported protocol: {}", site.protocol));
+    }
     if site.host.is_empty() {
         return Err("Host is empty".into());
     }
@@ -369,7 +452,51 @@ async fn connect(app: AppHandle, state: State<'_, AppState>, mut site: Site) -> 
     .await?;
     let id = state.next_session.fetch_add(1, Ordering::Relaxed) + 1;
 
-    let (session, home, secure) = if site.protocol == "s3" {
+    let (session, home, secure) = if site.protocol == "sftp" {
+        let mut cfg = sftp_config_of(&site)?;
+        let app2 = app.clone();
+        cfg.status = Some(Arc::new(move |m: &str| log(&app2, "status", m)));
+        let client = SftpClient::connect(&cfg).await.map_err(|e| {
+            let m = format!("{e:#}");
+            log(&app, "error", format!("Could not connect to server: {m}"));
+            m
+        })?;
+        let home = if site.remote_dir.is_empty() { client.home().to_owned() } else { site.remote_dir.clone() };
+        // Transfers reuse the settings; the host key is in known_hosts now.
+        let mut transfer_cfg = cfg.clone();
+        transfer_cfg.status = None;
+        transfer_cfg.trust_fingerprint = None;
+        let user = if cfg.user.is_empty() { std::env::var("USER").unwrap_or_default() } else { cfg.user.clone() };
+        let session = Session {
+            label: format!("sftp://{user}@{}", cfg.host),
+            kind: Kind::Sftp(transfer_cfg),
+            browse: tokio::sync::Mutex::new(Some(Backend::Sftp(client))),
+        };
+        (session, home, true)
+    } else if is_webdav(&site.protocol) {
+        let cfg = webdav_config_of(&site)?;
+        log(&app, "status", format!("Connecting to {}...", cfg.url));
+        let client = WebdavClient::connect(&cfg).await.map_err(|e| {
+            let m = err_chain(e);
+            log(&app, "error", format!("Could not connect to server: {m}"));
+            m
+        })?;
+        let server = if client.server.is_empty() { String::new() } else { format!(" ({})", client.server) };
+        log(&app, "status", format!("Connected to WebDAV server{server}"));
+        let secure = cfg.url.scheme() == "https";
+        if !secure {
+            log(&app, "error", "Connection is not encrypted (plain HTTP); the password is sent in clear text");
+        }
+        let home = if site.remote_dir.is_empty() { "/".into() } else { site.remote_dir.clone() };
+        let user = if cfg.user.is_empty() { String::new() } else { format!("{}@", cfg.user) };
+        let label = format!("{}://{user}{}{}", site.protocol, cfg.url.host_str().unwrap_or(""), cfg.url.path().trim_end_matches('/'));
+        let session = Session {
+            label,
+            kind: Kind::Webdav(client.clone()),
+            browse: tokio::sync::Mutex::new(Some(Backend::Webdav(client))),
+        };
+        (session, home, secure)
+    } else if site.protocol == "s3" {
         let cfg = s3_config_of(&site);
         let where_ = s3_where(&cfg);
         log(&app, "status", format!("Connecting to {where_}..."));
@@ -435,6 +562,8 @@ struct TestReport {
     elapsed_ms: u64,
     /// The failure was an untrusted TLS certificate.
     cert_error: bool,
+    /// Fingerprint of an unknown SSH host key the user may choose to trust.
+    host_key: Option<String>,
 }
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(12);
@@ -452,7 +581,67 @@ async fn test_connection(mut site: Site) -> CmdResult<TestReport> {
     let t0 = Instant::now();
     let mut r = TestReport::default();
 
-    if site.protocol == "s3" {
+    if site.protocol == "sftp" {
+        let mut cfg = sftp_config_of(&site)?;
+        cfg.timeout = TEST_TIMEOUT;
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        cfg.status = Some(Arc::new(move |m: &str| sink.lock().unwrap().push(format!("Status:   {m}"))));
+        r.details.push(format!("Server: {}:{}", cfg.host, cfg.port));
+        match SftpClient::connect(&cfg).await {
+            Err(e) => {
+                let m = format!("{e:#}");
+                if let Some(rest) = m.strip_prefix("UNKNOWN_HOST_KEY ") {
+                    let fp = rest.split_whitespace().next().unwrap_or("").to_owned();
+                    r.summary = format!("This server is not known yet. Its host key fingerprint is {fp}. Only trust it if it matches what the server administrator gave you.");
+                    r.host_key = Some(fp);
+                } else {
+                    r.summary = m;
+                }
+            }
+            Ok(c) => {
+                r.details.push("Encryption: SSH".into());
+                let start = if site.remote_dir.is_empty() { c.home().to_owned() } else { site.remote_dir.clone() };
+                match c.list(&start).await {
+                    Ok(l) => {
+                        r.ok = true;
+                        r.details.push(format!("Directory {start}: {} item(s)", l.len()));
+                        r.summary = "Connected, logged in and listed the start directory.".into();
+                    }
+                    Err(e) => r.summary = format!("Logged in, but listing {start} failed: {e:#}"),
+                }
+                c.close().await;
+            }
+        }
+        r.transcript = std::mem::take(&mut *lines.lock().unwrap());
+    } else if is_webdav(&site.protocol) {
+        let mut cfg = webdav_config_of(&site)?;
+        cfg.timeout = TEST_TIMEOUT;
+        r.details.push(format!("URL: {}", cfg.url));
+        r.details.push(if cfg.url.scheme() == "https" { "Encryption: TLS (HTTPS)".into() } else { "Encryption: none — plain HTTP, the password is sent in clear text".into() });
+        match tokio::time::timeout(TEST_TIMEOUT, WebdavClient::connect(&cfg)).await {
+            Err(_) => r.summary = format!("No answer within {} seconds.", TEST_TIMEOUT.as_secs()),
+            Ok(Err(e)) => {
+                let m = err_chain(e);
+                r.cert_error = m.contains("certificate");
+                r.summary = m;
+            }
+            Ok(Ok(c)) => {
+                if !c.server.is_empty() {
+                    r.details.push(format!("Server software: {}", c.server));
+                }
+                let start = if site.remote_dir.is_empty() { "/".to_owned() } else { site.remote_dir.clone() };
+                match c.list(&start).await {
+                    Ok(l) => {
+                        r.ok = true;
+                        r.details.push(format!("Directory {start}: {} item(s)", l.len()));
+                        r.summary = "Connected, logged in and listed the start directory.".into();
+                    }
+                    Err(e) => r.summary = format!("Connected, but listing {start} failed: {e:#}"),
+                }
+            }
+        }
+    } else if site.protocol == "s3" {
         let cfg = s3_config_of(&site);
         r.details.push(format!("Endpoint: {}", s3_where(&cfg)));
         if cfg.access_key.is_some() && cfg.secret_key.is_none() {
@@ -533,7 +722,7 @@ async fn test_connection(mut site: Site) -> CmdResult<TestReport> {
 /// Save a secret that was typed in at connect time.
 #[tauri::command]
 async fn site_secret_set(id: String, kind: String, value: String) -> CmdResult<()> {
-    if id.is_empty() || !(kind == SECRET_PASSWORD || kind == SECRET_S3) {
+    if id.is_empty() || ![SECRET_PASSWORD, SECRET_S3, SECRET_PASSPHRASE].contains(&kind.as_str()) {
         return Err("invalid site".into());
     }
     blocking(move || secret_set(&id, &kind, &value)).await?
@@ -571,7 +760,7 @@ fn s3_path(path: &str) -> &str {
 fn backend_path(s: &Session, path: &str) -> String {
     match s.kind {
         Kind::S3(_) => s3_path(path).to_owned(),
-        Kind::Ftp(_) => path.to_owned(),
+        Kind::Ftp(_) | Kind::Sftp(_) | Kind::Webdav(_) => path.to_owned(),
     }
 }
 
@@ -657,7 +846,7 @@ async fn remote_presign(state: State<'_, AppState>, session: u32, path: String, 
     let s = state.session(session)?;
     match &s.kind {
         Kind::S3(c) => c.presign(s3_path(&path), Duration::from_secs(expires)).await.map_err(err_chain),
-        Kind::Ftp(_) => Err("Pre-signed URLs are only available for S3".into()),
+        _ => Err("Pre-signed URLs are only available for S3".into()),
     }
 }
 
@@ -667,7 +856,11 @@ async fn remote_presign(state: State<'_, AppState>, session: u32, path: String, 
 
 #[tauri::command]
 fn local_home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    // $HOME, or the account's home from the user database when it is unset.
+    std::env::home_dir()
+        .filter(|p| p.is_dir())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".into())
 }
 
 #[tauri::command]
@@ -933,7 +1126,9 @@ fn read_sites(file: &Path) -> CmdResult<Vec<Site>> {
 fn mark_saved(sites: &mut [Site]) {
     for s in sites {
         let kind = if s.protocol == "s3" { SECRET_S3 } else { SECRET_PASSWORD };
-        s.password_saved = s.save_password && secret_get(&s.id, kind).is_some();
+        s.password_saved = s.save_password
+            && (secret_get(&s.id, kind).is_some()
+                || (s.protocol == "sftp" && secret_get(&s.id, SECRET_PASSPHRASE).is_some()));
     }
 }
 
@@ -972,14 +1167,19 @@ async fn sites_save(app: AppHandle, sites: Vec<Site>) -> CmdResult<Vec<Site>> {
                 if !s.secret_key.is_empty() {
                     secret_set(&s.id, SECRET_S3, &s.secret_key)?;
                 }
+                if !s.key_passphrase.is_empty() {
+                    secret_set(&s.id, SECRET_PASSPHRASE, &s.key_passphrase)?;
+                }
             } else {
                 secret_delete(&s.id, SECRET_PASSWORD);
                 secret_delete(&s.id, SECRET_S3);
+                secret_delete(&s.id, SECRET_PASSPHRASE);
             }
         }
         for o in old.iter().filter(|o| !o.id.is_empty() && !sites.iter().any(|s| s.id == o.id)) {
             secret_delete(&o.id, SECRET_PASSWORD);
             secret_delete(&o.id, SECRET_S3);
+            secret_delete(&o.id, SECRET_PASSPHRASE);
         }
         if let Some(dir) = f.parent() {
             std::fs::create_dir_all(dir).map_err(err)?;

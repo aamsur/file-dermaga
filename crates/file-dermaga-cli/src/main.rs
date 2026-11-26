@@ -10,6 +10,8 @@ use file_dermaga_core::DirEntry;
 use file_dermaga_ftp::{FtpClient, FtpConfig, Security};
 use file_dermaga_transfer::{basename, join, parent, safe_name, Backend, Event};
 use file_dermaga_s3::{S3Client, S3Config, UploadOptions};
+use file_dermaga_sftp::{SftpClient, SftpConfig};
+use file_dermaga_webdav::{WebdavClient, WebdavConfig};
 use percent_encoding::percent_decode_str;
 
 #[derive(Parser)]
@@ -19,6 +21,8 @@ URLs:
   ftp://[user[:pass]@]host[:port]/path    FTP, upgrades to TLS when offered
   ftpes://user@host/path                  FTP with required explicit TLS
   ftps://user@host/path                   FTP with implicit TLS (port 990)
+  sftp://[user[:pass]@]host[:port]/path   SFTP (SSH); keys from ssh-agent or ~/.ssh
+  davs://[user@]host[:port]/path          WebDAV over HTTPS (dav:// for plain HTTP)
   s3://bucket/key                         Amazon S3 or S3-compatible storage
 
 S3 credentials come from --access-key/--secret-key, the AWS_* environment
@@ -38,6 +42,15 @@ struct Opts {
     /// Never use TLS for ftp:// URLs
     #[arg(long, global = true)]
     plain: bool,
+    /// SFTP: private key file (default: ssh-agent, then ~/.ssh/id_*)
+    #[arg(short = 'i', long, global = true, help_heading = "SFTP")]
+    key: Option<std::path::PathBuf>,
+    /// SFTP: passphrase of the private key
+    #[arg(long, env = "FILE_DERMAGA_KEY_PASSPHRASE", hide_env_values = true, global = true, help_heading = "SFTP")]
+    key_passphrase: Option<String>,
+    /// SFTP: trust and remember an unknown server host key
+    #[arg(long, global = true, help_heading = "SFTP")]
+    accept_new_host_key: bool,
     /// Accept invalid or self-signed TLS certificates
     #[arg(short = 'k', long, global = true)]
     insecure: bool,
@@ -150,6 +163,12 @@ impl Cmd {
 enum Target {
     Ftp(FtpConfig, String),
     S3(String),
+    Sftp(SftpConfig, String),
+    Webdav(WebdavConfig, String),
+}
+
+fn ask_password(user: &str, host: &str) -> Result<String> {
+    Ok(rpassword::prompt_password(format!("Password for {user}@{host}: "))?)
 }
 
 fn decode(s: &str) -> String {
@@ -161,12 +180,49 @@ fn parse_target(s: &str, opts: &Opts) -> Result<Target> {
         return Ok(Target::S3(rest.to_owned()));
     }
     let url = url::Url::parse(s).with_context(|| format!("invalid URL: {s}"))?;
+    let path = decode(url.path());
+    let path = if path.is_empty() { "/".to_owned() } else { path };
+    let url_password = url.password().map(decode).or_else(|| opts.password.clone());
+
+    if url.scheme() == "sftp" {
+        let host = url.host_str().context("URL has no host")?.trim_start_matches('[').trim_end_matches(']');
+        let mut cfg = SftpConfig::new(host);
+        cfg.port = url.port().unwrap_or(22);
+        cfg.user = decode(url.username());
+        cfg.password = url_password.unwrap_or_default();
+        cfg.key_file = opts.key.clone();
+        cfg.key_passphrase = opts.key_passphrase.clone();
+        cfg.accept_new_host_key = opts.accept_new_host_key;
+        cfg.timeout = Duration::from_secs(opts.timeout);
+        if opts.verbose {
+            cfg.status = Some(std::sync::Arc::new(|m: &str| eprintln!("   Status: {m}")));
+        }
+        return Ok(Target::Sftp(cfg, path));
+    }
+
+    if matches!(url.scheme(), "dav" | "davs" | "webdav" | "webdavs") {
+        let host = url.host_str().context("URL has no host")?;
+        let scheme = if url.scheme().ends_with('s') { "https" } else { "http" };
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        // The server root is the base; the whole URL path is the remote path.
+        let mut cfg = WebdavConfig::new(&format!("{scheme}://{host}{port}/"))?;
+        cfg.user = decode(url.username());
+        cfg.password = match url_password {
+            Some(p) => p,
+            None if !cfg.user.is_empty() => ask_password(&cfg.user, host)?,
+            None => String::new(),
+        };
+        cfg.accept_invalid_certs = opts.insecure;
+        cfg.timeout = Duration::from_secs(opts.timeout);
+        return Ok(Target::Webdav(cfg, path));
+    }
+
     let (security, default_port) = match url.scheme() {
         "ftp" if opts.plain => (Security::Plain, 21),
         "ftp" => (Security::TryTls, 21),
         "ftpes" => (Security::ExplicitTls, 21),
         "ftps" => (Security::ImplicitTls, 990),
-        other => bail!("unsupported scheme {other}:// (use ftp, ftpes, ftps or s3)"),
+        other => bail!("unsupported scheme {other}:// (use ftp, ftpes, ftps, sftp, dav, davs or s3)"),
     };
     let host = url.host_str().context("URL has no host")?;
     let host = host.trim_start_matches('[').trim_end_matches(']').to_owned();
@@ -178,16 +234,12 @@ fn parse_target(s: &str, opts: &Opts) -> Result<Target> {
     cfg.verbose = opts.verbose;
     cfg.timeout = Duration::from_secs(opts.timeout);
     cfg.user = decode(url.username());
-    cfg.password = match (url.password(), &opts.password) {
-        (Some(p), _) => decode(p),
-        (None, Some(p)) => p.clone(),
-        (None, None) if !cfg.user.is_empty() && cfg.user != "anonymous" => {
-            rpassword::prompt_password(format!("Password for {}@{}: ", cfg.user, cfg.host))?
-        }
-        _ => String::new(),
+    cfg.password = match url_password {
+        Some(p) => p,
+        None if !cfg.user.is_empty() && cfg.user != "anonymous" => ask_password(&cfg.user, &cfg.host)?,
+        None => String::new(),
     };
-    let path = decode(url.path());
-    Ok(Target::Ftp(cfg, if path.is_empty() { "/".into() } else { path }))
+    Ok(Target::Ftp(cfg, path))
 }
 
 fn s3_config(opts: &Opts) -> S3Config {
@@ -329,7 +381,7 @@ fn resolve_to(from: &str, to: &str, s3: bool, opts: &Opts) -> Result<String> {
     if to.contains("://") {
         return Ok(match parse_target(to, opts)? {
             Target::S3(p) => p,
-            Target::Ftp(_, p) => p,
+            Target::Ftp(_, p) | Target::Sftp(_, p) | Target::Webdav(_, p) => p,
         });
     }
     if let Some(abs) = to.strip_prefix('/') {
@@ -394,6 +446,16 @@ async fn exec(r: &mut Backend, cmd: &Cmd, path: &str, opts: &Opts) -> Result<()>
     Ok(())
 }
 
+/// Run one command on a connected backend and close it.
+async fn run(mut remote: Backend, cmd: &Cmd, path: &str, opts: &Opts) -> Result<()> {
+    let res = match cmd {
+        Cmd::Chmod { mode, .. } => remote.chmod(path, mode).await,
+        cmd => exec(&mut remote, cmd, path, opts).await,
+    };
+    remote.close().await;
+    res
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -409,13 +471,45 @@ async fn main() -> Result<()> {
             if !client.is_secure() && cfg.security == Security::TryTls {
                 eprintln!("warning: connection is not encrypted");
             }
-            let mut remote = Backend::Ftp(client);
-            let res = match (&cli.cmd, &mut remote) {
-                (Cmd::Chmod { mode, .. }, Backend::Ftp(c)) => c.chmod(&path, mode).await.map_err(Into::into),
-                (cmd, remote) => exec(remote, cmd, &path, opts).await,
+            run(Backend::Ftp(client), &cli.cmd, &path, opts).await
+        }
+        Target::Sftp(mut cfg, path) => {
+            if matches!(cli.cmd, Cmd::Url { .. }) {
+                bail!("pre-signed URLs are only available for s3:// targets");
+            }
+            let client = match SftpClient::connect(&cfg).await {
+                Ok(c) => c,
+                // Agent and default keys did not work: ask for a password.
+                Err(e)
+                    if cfg.password.is_empty()
+                        && cfg.key_file.is_none()
+                        && e.to_string().contains("authentication failed")
+                        && std::io::stdin().is_terminal() =>
+                {
+                    let user = if cfg.user.is_empty() { std::env::var("USER").unwrap_or_default() } else { cfg.user.clone() };
+                    cfg.password = ask_password(&user, &cfg.host)?;
+                    SftpClient::connect(&cfg).await?
+                }
+                // Encrypted key and no passphrase given: ask for it.
+                Err(e) if e.to_string().starts_with("KEY_PASSPHRASE_NEEDED") && std::io::stdin().is_terminal() => {
+                    let file = cfg.key_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    cfg.key_passphrase = Some(rpassword::prompt_password(format!("Passphrase for key {file}: "))?);
+                    SftpClient::connect(&cfg).await?
+                }
+                Err(e) => {
+                    if e.to_string().starts_with("UNKNOWN_HOST_KEY") {
+                        bail!("{e}\nVerify the fingerprint with the server administrator, then re-run with --accept-new-host-key.");
+                    }
+                    return Err(e);
+                }
             };
-            remote.close().await;
-            res
+            run(Backend::Sftp(client), &cli.cmd, &path, opts).await
+        }
+        Target::Webdav(cfg, path) => {
+            if matches!(cli.cmd, Cmd::Url { .. }) {
+                bail!("pre-signed URLs are only available for s3:// targets");
+            }
+            run(Backend::Webdav(WebdavClient::new(&cfg)?), &cli.cmd, &path, opts).await
         }
         Target::S3(path) => {
             let client = S3Client::connect(&s3_config(opts)).await?;
@@ -424,8 +518,7 @@ async fn main() -> Result<()> {
                     println!("{}", client.presign(&path, Duration::from_secs(*expires)).await?);
                     Ok(())
                 }
-                Cmd::Chmod { .. } => bail!("chmod is not supported for S3"),
-                cmd => exec(&mut Backend::S3(client), cmd, &path, opts).await,
+                cmd => run(Backend::S3(client), cmd, &path, opts).await,
             }
         }
     }

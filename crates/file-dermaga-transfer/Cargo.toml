@@ -10,5 +10,7 @@ rust-version.workspace = true
 file-dermaga-core.workspace = true
 file-dermaga-ftp.workspace = true
 file-dermaga-s3.workspace = true
+file-dermaga-sftp.workspace = true
+file-dermaga-webdav.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

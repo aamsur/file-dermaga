@@ -1,6 +1,6 @@
 [package]
 name = "file-dermaga-cli"
-description = "Command line FTP/FTPS/S3 client"
+description = "Command line FTP/FTPS/SFTP/WebDAV/S3 client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,8 @@ path = "src/main.rs"
 file-dermaga-core.workspace = true
 file-dermaga-ftp.workspace = true
 file-dermaga-s3.workspace = true
+file-dermaga-sftp.workspace = true
+file-dermaga-webdav.workspace = true
 file-dermaga-transfer.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
