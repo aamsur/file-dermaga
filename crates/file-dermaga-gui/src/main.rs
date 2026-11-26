@@ -12,12 +12,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use file_dermaga_core::{Accuracy, DirEntry};
+use file_dermaga_core::{Accuracy, DateTime, DirEntry};
 use file_dermaga_ftp::{FtpClient, FtpConfig, LogKind, Logger, Security};
 use file_dermaga_s3::{S3Client, S3Config, UploadOptions};
 use file_dermaga_sftp::{SftpClient, SftpConfig};
 use file_dermaga_webdav::{WebdavClient, WebdavConfig};
-use file_dermaga_transfer::{basename, Backend, Event};
+use file_dermaga_transfer::{
+    basename, decide, Backend, BoxFuture, Conflict, Decision, Event, ExistsAction, FileInfo, Limiter, Outcome, Resolver,
+    TransferOpts,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Semaphore;
@@ -188,6 +191,12 @@ struct AppState {
     transfers: Mutex<HashMap<u64, tauri::async_runtime::JoinHandle<()>>>,
     next_transfer: AtomicU64,
     slots: Arc<Semaphore>,
+    max_slots: Mutex<usize>,
+    /// Global speed limits shared by all transfers.
+    limiter: Limiter,
+    /// Open "file exists" questions, answered by `conflict_answer`.
+    prompts: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<Decision>, Conflict)>>,
+    next_prompt: AtomicU64,
 }
 
 impl AppState {
@@ -830,10 +839,18 @@ async fn remote_delete(app: AppHandle, state: State<'_, AppState>, session: u32,
 }
 
 #[tauri::command]
-async fn remote_rename(app: AppHandle, state: State<'_, AppState>, session: u32, from: String, to: String) -> CmdResult<()> {
+async fn remote_rename(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session: u32,
+    from: String,
+    to: String,
+    overwrite: Option<bool>,
+) -> CmdResult<()> {
     let s = state.session(session)?;
     let (f, t) = (backend_path(&s, &from), backend_path(&s, &to));
-    let r = with_browse(&state, session, async |b| b.rename(&f, &t).await).await;
+    let ow = overwrite.unwrap_or(false);
+    let r = with_browse(&state, session, async |b| b.rename(&f, &t, ow).await).await;
     match &r {
         Ok(()) => log(&app, "status", format!("Renamed \"{from}\" to \"{to}\"")),
         Err(e) => log(&app, "error", e.clone()),
@@ -942,8 +959,8 @@ async fn local_delete(items: Vec<PathItem>) -> CmdResult<()> {
 }
 
 #[tauri::command]
-async fn local_rename(from: String, to: String) -> CmdResult<()> {
-    if tokio::fs::try_exists(&to).await.unwrap_or(false) {
+async fn local_rename(from: String, to: String, overwrite: Option<bool>) -> CmdResult<()> {
+    if !overwrite.unwrap_or(false) && tokio::fs::try_exists(&to).await.unwrap_or(false) {
         return Err(format!("{to} already exists"));
     }
     tokio::fs::rename(&from, &to).await.map_err(|e| format!("{from}: {e}"))
@@ -963,6 +980,70 @@ struct TransferRequest {
     remote: String,
     is_dir: bool,
     size: Option<u64>,
+    /// Source modification time from the listing (ms) and its precision.
+    #[serde(default)]
+    mtime: Option<i64>,
+    #[serde(default)]
+    mtime_acc: Option<String>,
+    /// ask | overwrite | newer | size | size-or-newer | resume | skip
+    #[serde(default)]
+    download_exists: Option<String>,
+    #[serde(default)]
+    upload_exists: Option<String>,
+    #[serde(default)]
+    preserve_time: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictDto {
+    prompt_id: u64,
+    transfer_id: u64,
+    direction: String,
+    source_path: String,
+    target_path: String,
+    source_size: Option<u64>,
+    source_mtime: Option<i64>,
+    target_size: Option<u64>,
+    target_mtime: Option<i64>,
+}
+
+/// Answer an open "file exists" question. `action` is an exists action
+/// (overwrite, newer, size, size-or-newer, resume, skip) or "rename" with
+/// `name`.
+#[tauri::command]
+fn conflict_answer(state: State<'_, AppState>, prompt_id: u64, action: String, name: Option<String>) -> CmdResult<()> {
+    let Some((tx, c)) = state.prompts.lock().unwrap().remove(&prompt_id) else {
+        return Ok(()); // transfer was cancelled meanwhile
+    };
+    let decision = if action == "rename" {
+        Decision::Rename(name.filter(|n| !n.trim().is_empty()).ok_or("A new name is required")?)
+    } else {
+        let a: ExistsAction = action.parse()?;
+        decide(a, &c.source, &c.target).unwrap_or(Decision::Skip)
+    };
+    let _ = tx.send(decision);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_transfer_limits(state: State<'_, AppState>, down_kib: u64, up_kib: u64, max_transfers: usize) -> CmdResult<()> {
+    state.limiter.set_kib(down_kib, up_kib);
+    let want = max_transfers.clamp(1, 10);
+    let mut cur = state.max_slots.lock().unwrap();
+    if want > *cur {
+        state.slots.add_permits(want - *cur);
+        *cur = want;
+    } else if want < *cur {
+        // Permits in use are forgotten when they come back.
+        let forgotten = state.slots.forget_permits(*cur - want);
+        *cur -= forgotten;
+    }
+    Ok(())
+}
+
+fn ms_of(t: &DateTime) -> Option<i64> {
+    t.unix_millis()
 }
 
 #[tauri::command]
@@ -970,6 +1051,7 @@ fn transfer_start(app: AppHandle, state: State<'_, AppState>, req: TransferReque
     let session = state.session(req.session)?;
     let id = state.next_transfer.fetch_add(1, Ordering::Relaxed) + 1;
     let slots = state.slots.clone();
+    let limiter = state.limiter.clone();
 
     let base = TransferEvent {
         id,
@@ -988,7 +1070,30 @@ fn transfer_start(app: AppHandle, state: State<'_, AppState>, req: TransferReque
         };
         emit(TransferEvent { state: "active", ..base.clone() });
 
-        let result = run_transfer(&session, &req, &mut |ev| match ev {
+        let app3 = app2.clone();
+        let mut resolver = move |c: Conflict| -> BoxFuture<Decision> {
+            let app = app3.clone();
+            Box::pin(async move {
+                let Some(state) = app.try_state::<AppState>() else { return Decision::Skip };
+                let prompt_id = state.next_prompt.fetch_add(1, Ordering::Relaxed) + 1;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let dto = ConflictDto {
+                    prompt_id,
+                    transfer_id: id,
+                    direction: c.direction.to_string(),
+                    source_path: c.source_path.clone(),
+                    target_path: c.target_path.clone(),
+                    source_size: c.source.size,
+                    source_mtime: c.source.mtime.as_ref().and_then(ms_of),
+                    target_size: c.target.size,
+                    target_mtime: c.target.mtime.as_ref().and_then(ms_of),
+                };
+                state.prompts.lock().unwrap().insert(prompt_id, (tx, c));
+                let _ = app.emit("transfer-conflict", dto);
+                rx.await.unwrap_or(Decision::Skip)
+            })
+        };
+        let result = run_transfer(&session, &req, &limiter, &mut resolver, &mut |ev| match ev {
             TransferUpdate::Progress(done, total) => emit(TransferEvent {
                 state: "progress",
                 done,
@@ -1006,13 +1111,27 @@ fn transfer_start(app: AppHandle, state: State<'_, AppState>, req: TransferReque
                 log(&app2, "error", format!("{path}: {error}"));
                 emit(TransferEvent { state: "file-failed", local: path, error: Some(error), ..base.clone() })
             }
+            TransferUpdate::FileSkipped { path } => log(&app2, "status", format!("Skipped {path}: target exists")),
         })
         .await;
 
         match result {
-            Ok(bytes) => {
-                log(&app2, "status", format!("File transfer successful, transferred {bytes} bytes"));
-                emit(TransferEvent { state: "done", done: bytes, ..base.clone() });
+            Ok(r) => {
+                let note = if r.skipped > 0 && r.files == 0 {
+                    log(&app2, "status", "File exists, skipped");
+                    Some("Skipped (target exists)".to_owned())
+                } else {
+                    let mut parts = Vec::new();
+                    if r.resumed_from > 0 {
+                        parts.push(format!("resumed at {} bytes", r.resumed_from));
+                    }
+                    if r.skipped > 0 {
+                        parts.push(format!("{} skipped", r.skipped));
+                    }
+                    log(&app2, "status", format!("File transfer successful, transferred {} bytes", r.bytes));
+                    (!parts.is_empty()).then(|| parts.join(", "))
+                };
+                emit(TransferEvent { state: "done", done: r.bytes, error: note, ..base.clone() });
             }
             Err(e) => {
                 let msg = err_chain(e);
@@ -1032,16 +1151,43 @@ enum TransferUpdate {
     Progress(u64, Option<u64>),
     File { local: String, remote: String, total: Option<u64> },
     FileFailed { path: String, error: String },
+    FileSkipped { path: String },
+}
+
+#[derive(Default)]
+struct RunResult {
+    bytes: u64,
+    files: usize,
+    skipped: usize,
+    resumed_from: u64,
+}
+
+fn accuracy_of(s: Option<&str>) -> Accuracy {
+    match s {
+        Some("d") => Accuracy::Days,
+        Some("h") => Accuracy::Hours,
+        Some("m") => Accuracy::Minutes,
+        _ => Accuracy::Seconds,
+    }
 }
 
 async fn run_transfer(
     session: &Session,
     req: &TransferRequest,
+    limiter: &Limiter,
+    resolve: Resolver<'_>,
     update: &mut (dyn FnMut(TransferUpdate) + Send),
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<RunResult> {
     let mut backend = session.transfer_backend().await?;
     let remote = backend_path(session, &req.remote);
     let local = PathBuf::from(&req.local);
+    let parse = |a: &Option<String>| a.as_deref().and_then(|s| s.parse().ok()).unwrap_or(ExistsAction::Ask);
+    let opts = TransferOpts {
+        download_exists: parse(&req.download_exists),
+        upload_exists: parse(&req.upload_exists),
+        preserve_time: req.preserve_time,
+        limiter: limiter.clone(),
+    };
 
     // Throttle progress events to ~10 per second.
     let mut last = Instant::now() - Duration::from_secs(1);
@@ -1053,41 +1199,56 @@ async fn run_transfer(
         }
     };
 
-    let res = if req.is_dir {
-        let mut bytes = 0u64;
+    let mut result = RunResult::default();
+    let res: anyhow::Result<()> = if req.is_dir {
         let mut current_total = None;
-        let mut file_bytes = 0u64;
         let mut handler = |ev: Event| match ev {
             Event::FileStart { remote, local, size } => {
                 current_total = size;
-                file_bytes = 0;
                 update(TransferUpdate::File { local: local.display().to_string(), remote, total: size });
             }
-            Event::Progress { done } => {
-                file_bytes = done;
-                progress(done, current_total, update);
+            Event::Progress { done } => progress(done, current_total, update),
+            Event::FileDone { bytes: n } => {
+                result.bytes += n;
+                result.files += 1;
             }
-            Event::FileDone { bytes: n } => bytes += n,
-            Event::Skipped { .. } => {}
+            Event::Skipped { path, reason } => {
+                if reason == "target exists" {
+                    result.skipped += 1;
+                    update(TransferUpdate::FileSkipped { path });
+                }
+            }
             Event::Failed { path, error } => update(TransferUpdate::FileFailed { path, error }),
         };
-        let r = if req.direction == "upload" {
-            backend.upload_tree(&local, &remote, &mut handler).await
+        if req.direction == "upload" {
+            backend.upload_tree(&local, &remote, &opts, &mut *resolve, &mut handler).await
         } else {
-            backend.download_tree(&remote, &local, &mut handler).await
-        };
-        let _ = file_bytes;
-        r.map(|()| bytes)
-    } else if req.direction == "upload" {
-        backend.upload(&local, &remote, &mut |d| progress(d, total_hint, update)).await
-    } else {
-        if let Some(parent) = local.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            backend.download_tree(&remote, &local, &opts, &mut *resolve, &mut handler).await
         }
-        backend.download(&remote, &local, &mut |d| progress(d, total_hint, update)).await
+    } else {
+        let outcome = if req.direction == "upload" {
+            backend.upload_file(&local, &remote, None, &opts, &mut *resolve, &mut |d| progress(d, total_hint, update)).await
+        } else {
+            if let Some(parent) = local.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let known = req.size.map(|size| FileInfo {
+                size: Some(size),
+                mtime: req.mtime.map(|ms| DateTime::from_unix_millis(ms, accuracy_of(req.mtime_acc.as_deref()))),
+            });
+            backend.download_file(&remote, &local, known, &opts, &mut *resolve, &mut |d| progress(d, total_hint, update)).await
+        };
+        outcome.map(|o| match o {
+            Outcome::Done { bytes, resumed_from } => {
+                result.bytes = bytes;
+                result.files = 1;
+                result.resumed_from = resumed_from;
+            }
+            Outcome::Skipped => result.skipped = 1,
+        })
     };
     backend.close().await;
-    res
+    res.map(|()| result)
 }
 
 #[tauri::command]
@@ -1223,6 +1384,10 @@ fn main() {
             transfers: Mutex::new(HashMap::new()),
             next_transfer: AtomicU64::new(0),
             slots: Arc::new(Semaphore::new(MAX_PARALLEL_TRANSFERS)),
+            max_slots: Mutex::new(MAX_PARALLEL_TRANSFERS),
+            limiter: Limiter::default(),
+            prompts: Mutex::new(HashMap::new()),
+            next_prompt: AtomicU64::new(0),
         })
         .setup(|_app| {
             migrate_legacy_config(_app.handle());
@@ -1254,6 +1419,8 @@ fn main() {
             local_rename,
             transfer_start,
             transfer_cancel,
+            conflict_answer,
+            set_transfer_limits,
             sites_load,
             sites_save,
             test_connection,

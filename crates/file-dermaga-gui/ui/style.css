@@ -311,3 +311,13 @@ table.grid .num { text-align: right; }
 /* Small icon button inside a path bar (e.g. Home) */
 .pathbtn { width: 28px; height: 26px; padding: 2px; display: grid; place-items: center; flex: none; }
 .pathbtn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Transfer settings and "file exists" dialogs */
+form.settings { display: grid; grid-template-columns: 170px 1fr; gap: 7px 10px; align-items: center; min-width: 520px; }
+form.settings h3 { grid-column: 1 / -1; margin: 8px 0 0; font-size: 13px; border-bottom: 1px solid var(--border-soft); padding-bottom: 3px; }
+form.settings .hint { grid-column: 2; color: var(--muted); font-size: 12px; }
+form.settings .check, .cf-actions .check, .dialog .body > .check { display: flex; align-items: center; gap: 6px; }
+.cf-file { background: var(--panel); border: 1px solid var(--border-soft); border-radius: 6px; padding: 6px 10px; margin: 6px 0; max-width: 640px; }
+.cf-path { font-family: ui-monospace, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; -webkit-user-select: text; }
+.cf-meta { color: var(--muted); font-size: 12px; }
+.cf-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; margin: 10px 0; }

@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use file_dermaga_core::DirEntry;
 use file_dermaga_ftp::{FtpClient, FtpConfig, Security};
-use file_dermaga_transfer::{basename, join, parent, safe_name, Backend, Event};
+use file_dermaga_transfer::{always, basename, join, parent, safe_name, Backend, Decision, Event, ExistsAction, Outcome, TransferOpts};
 use file_dermaga_s3::{S3Client, S3Config, UploadOptions};
 use file_dermaga_sftp::{SftpClient, SftpConfig};
 use file_dermaga_webdav::{WebdavClient, WebdavConfig};
@@ -60,6 +60,19 @@ struct Opts {
     /// Network timeout in seconds
     #[arg(long, default_value_t = 20, global = true)]
     timeout: u64,
+
+    /// When the target file exists: overwrite, newer, size, size-or-newer, resume or skip
+    #[arg(long, default_value = "overwrite", global = true, help_heading = "Transfers")]
+    if_exists: String,
+    /// Resume interrupted transfers (same as --if-exists resume)
+    #[arg(short = 'c', long = "continue", global = true, help_heading = "Transfers")]
+    resume: bool,
+    /// Speed limit in KiB/s for downloads and uploads (0 = unlimited)
+    #[arg(long, default_value_t = 0, global = true, help_heading = "Transfers")]
+    limit_rate: u64,
+    /// Keep the source file's modification time
+    #[arg(short = 'p', long, global = true, help_heading = "Transfers")]
+    preserve_time: bool,
 
     /// S3 endpoint for compatible services (MinIO, Wasabi, R2, ...)
     #[arg(long, env = "FILE_DERMAGA_S3_ENDPOINT", global = true, help_heading = "S3")]
@@ -128,7 +141,13 @@ enum Cmd {
     /// Delete an empty directory (S3: an empty bucket or folder)
     Rmdir { url: String },
     /// Rename or move; TO is a path on the same server, relative to the source directory
-    Mv { url: String, to: String },
+    Mv {
+        url: String,
+        to: String,
+        /// Replace an existing target
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Change permissions (FTP SITE CHMOD)
     Chmod { mode: String, url: String },
     /// Print a pre-signed download URL (S3)
@@ -343,19 +362,41 @@ fn tree_reporter() -> impl FnMut(Event) {
     }
 }
 
-async fn download_one(b: &mut Backend, remote: &str, local: &Path) -> Result<()> {
+fn transfer_opts(opts: &Opts) -> Result<TransferOpts> {
+    let action: ExistsAction = if opts.resume { ExistsAction::Resume } else { opts.if_exists.parse().map_err(anyhow::Error::msg)? };
+    if action == ExistsAction::Ask {
+        bail!("--if-exists ask is only available in the desktop app");
+    }
+    let t = TransferOpts { download_exists: action, upload_exists: action, preserve_time: opts.preserve_time, ..Default::default() };
+    t.limiter.set_kib(opts.limit_rate, opts.limit_rate);
+    Ok(t)
+}
+
+fn report(name: &str, p: &Progress, outcome: Outcome) {
+    match outcome {
+        Outcome::Done { bytes, resumed_from } => {
+            if resumed_from > 0 {
+                eprintln!("{name}: resumed at {}", human(resumed_from));
+            }
+            p.finish(bytes);
+        }
+        Outcome::Skipped => eprintln!("{name}: skipped (target exists)"),
+    }
+}
+
+async fn download_one(b: &mut Backend, remote: &str, local: &Path, t: &TransferOpts) -> Result<()> {
     let mut p = Progress::new(basename(remote), None);
-    let n = b.download(remote, local, &mut |n| p.update(n)).await?;
-    p.finish(n);
+    let outcome = b.download_file(remote, local, None, t, &mut always(Decision::Overwrite), &mut |n| p.update(n)).await?;
+    report(basename(remote), &p, outcome);
     Ok(())
 }
 
-async fn upload_one(b: &mut Backend, local: &Path, remote: &str) -> Result<()> {
+async fn upload_one(b: &mut Backend, local: &Path, remote: &str, t: &TransferOpts) -> Result<()> {
     let size = tokio::fs::metadata(local).await?.len();
     let name = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut p = Progress::new(&name, Some(size));
-    let n = b.upload(local, remote, &mut |n| p.update(n)).await?;
-    p.finish(n);
+    let outcome = b.upload_file(local, remote, None, t, &mut always(Decision::Overwrite), &mut |n| p.update(n)).await?;
+    report(&name, &p, outcome);
     Ok(())
 }
 
@@ -403,10 +444,11 @@ async fn exec(r: &mut Backend, cmd: &Cmd, path: &str, opts: &Opts) -> Result<()>
                 Some(l) => l.clone(),
                 None => PathBuf::from(name),
             };
+            let t = transfer_opts(opts)?;
             if *recursive {
-                r.download_tree(path, &dest, &mut tree_reporter()).await?;
+                r.download_tree(path, &dest, &t, &mut always(Decision::Overwrite), &mut tree_reporter()).await?;
             } else {
-                download_one(r, path, &dest).await?;
+                download_one(r, path, &dest, &t).await?;
             }
         }
         Cmd::Put { local, recursive, .. } => {
@@ -420,12 +462,12 @@ async fn exec(r: &mut Backend, cmd: &Cmd, path: &str, opts: &Opts) -> Result<()>
                 if !local.is_dir() {
                     bail!("{} is not a directory", local.display());
                 }
-                r.upload_tree(local, &dest, &mut tree_reporter()).await?;
+                r.upload_tree(local, &dest, &transfer_opts(opts)?, &mut always(Decision::Overwrite), &mut tree_reporter()).await?;
             } else {
                 if local.is_dir() {
                     bail!("{} is a directory (use -r)", local.display());
                 }
-                upload_one(r, local, &dest).await?;
+                upload_one(r, local, &dest, &transfer_opts(opts)?).await?;
             }
         }
         Cmd::Mkdir { .. } => r.mkdir(path).await?,
@@ -437,9 +479,9 @@ async fn exec(r: &mut Backend, cmd: &Cmd, path: &str, opts: &Opts) -> Result<()>
             }
         }
         Cmd::Rmdir { .. } => r.rmdir(path, false).await?,
-        Cmd::Mv { to, .. } => {
+        Cmd::Mv { to, force, .. } => {
             let to = resolve_to(path, to, s3, opts)?;
-            r.rename(path, &to).await?;
+            r.rename(path, &to, *force).await?;
         }
         Cmd::Chmod { .. } | Cmd::Url { .. } => unreachable!("handled per backend"),
     }

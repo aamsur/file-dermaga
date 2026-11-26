@@ -231,18 +231,49 @@ impl S3Client {
         Ok(keys)
     }
 
+    /// Size and time of an object (`None` if missing); buckets and
+    /// prefixes are reported as directories.
+    pub async fn stat(&self, path: &str) -> Result<Option<DirEntry>> {
+        let (bucket, key) = split(path);
+        if bucket.is_empty() || key.is_empty() || key.ends_with('/') {
+            return Ok(Some(DirEntry { flags: FLAG_DIR, ..Default::default() }));
+        }
+        match self.client.head_object().bucket(bucket).key(key).send().await {
+            Ok(h) => Ok(Some(DirEntry {
+                name: key.rsplit('/').next().unwrap_or("").to_owned(),
+                size: h.content_length().unwrap_or(-1),
+                time: to_datetime(h.last_modified()),
+                ..Default::default()
+            })),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) => Ok(None),
+            Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => Ok(None),
+            Err(e) => Err(sdk(e)).with_context(|| format!("checking s3://{bucket}/{key}")),
+        }
+    }
+
     pub async fn download<W: AsyncWrite + Unpin>(
         &self,
         path: &str,
         out: &mut W,
+        progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        self.download_from(path, out, 0, progress).await
+    }
+
+    /// Download from byte `offset` (HTTP Range), for resuming.
+    pub async fn download_from<W: AsyncWrite + Unpin>(
+        &self,
+        path: &str,
+        out: &mut W,
+        offset: u64,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
         let (bucket, key) = split(path);
-        let resp = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
+        let mut req = self.client.get_object().bucket(bucket).key(key);
+        if offset > 0 {
+            req = req.range(format!("bytes={offset}-"));
+        }
+        let resp = req
             .send()
             .await
             .map_err(sdk)
@@ -478,15 +509,11 @@ impl S3Client {
         }
         // CopyObject resets storage class and encryption unless they are
         // given again, so carry them over from the source object.
-        let head = self
-            .client
-            .head_object()
-            .bucket(fb)
-            .key(fk)
-            .send()
-            .await
-            .map_err(sdk)
-            .with_context(|| format!("reading s3://{fb}/{fk}"))?;
+        let head = match self.client.head_object().bucket(fb).key(fk).send().await {
+            Ok(h) => h,
+            Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => bail!("s3://{fb}/{fk}: no such object"),
+            Err(e) => return Err(sdk(e)).with_context(|| format!("reading s3://{fb}/{fk}")),
+        };
         self.client
             .copy_object()
             .copy_source(format!("{fb}/{}", encode_key(fk)))

@@ -20,9 +20,11 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::{known_hosts, HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::Disconnect;
 use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::rawsession::RawSftpSession;
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 /// Status messages for a log view.
 pub type StatusFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -187,7 +189,22 @@ impl client::Handler for Handler {
 pub struct SftpClient {
     handle: Handle<Handler>,
     sftp: SftpSession,
+    /// Second SFTP channel used for listings: it exposes each entry's
+    /// `longname` (ls -l line), the only source of owner/group names in
+    /// SFTP v3. `None` if the server refused a second channel.
+    raw: Option<RawSftpSession>,
     home: String,
+}
+
+/// Owner/group and permission string from an `ls -l` style longname:
+/// `drwxr-xr-x  2 alice staff  4096 Jan  1 00:00 name`.
+fn parse_longname(longname: &str) -> Option<(String, String)> {
+    let t: Vec<&str> = longname.split_whitespace().collect();
+    let perms = *t.first()?;
+    if perms.len() < 10 || !matches!(perms.as_bytes()[0], b'-' | b'd' | b'l' | b'b' | b'c' | b'p' | b's') || t.len() < 5 {
+        return None;
+    }
+    Some((perms[..10].to_owned(), format!("{} {}", t[2], t[3])))
 }
 
 /// Join a remote directory and a name.
@@ -430,7 +447,16 @@ impl SftpClient {
         let sftp = SftpSession::new(channel.into_stream()).await.context("SFTP handshake failed")?;
         sftp.set_timeout(cfg.timeout.as_secs().max(10));
         let home = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
-        Ok(Self { handle, sftp, home })
+        let raw = async {
+            let ch = handle.channel_open_session().await.ok()?;
+            ch.request_subsystem(true, "sftp").await.ok()?;
+            let raw = RawSftpSession::new(ch.into_stream());
+            raw.set_timeout(cfg.timeout.as_secs().max(10));
+            raw.init().await.ok()?;
+            Some(raw)
+        }
+        .await;
+        Ok(Self { handle, sftp, raw, home })
     }
 
     /// The user's start directory on the server.
@@ -438,20 +464,41 @@ impl SftpClient {
         &self.home
     }
 
-    pub async fn list(&self, path: &str) -> Result<Vec<DirEntry>> {
+    /// Names, attributes and longnames of a directory.
+    async fn read_dir_raw(&self, path: &str) -> Result<Vec<(String, FileAttributes, String)>> {
+        if let Some(raw) = &self.raw {
+            let h = raw.opendir(path).await.map_err(fx).with_context(|| format!("listing {path}"))?;
+            let mut out = Vec::new();
+            let res = loop {
+                match raw.readdir(h.handle.clone()).await {
+                    Ok(name) => out.extend(name.files.into_iter().map(|f| (f.filename, f.attrs, f.longname))),
+                    Err(SftpError::Status(st)) if st.status_code == StatusCode::Eof => break Ok(()),
+                    Err(e) => break Err(fx(e)),
+                }
+            };
+            let _ = raw.close(h.handle.clone()).await;
+            res.with_context(|| format!("listing {path}"))?;
+            return Ok(out);
+        }
         let dir = self.sftp.read_dir(path).await.map_err(fx).with_context(|| format!("listing {path}"))?;
+        Ok(dir.map(|e| (e.file_name(), e.metadata(), String::new())).collect())
+    }
+
+    pub async fn list(&self, path: &str) -> Result<Vec<DirEntry>> {
         let mut out = Vec::new();
-        for e in dir {
-            let name = e.file_name();
-            if name == "." || name == ".." {
+        for (name, attrs, longname) in self.read_dir_raw(path).await? {
+            if name == "." || name == ".." || name.is_empty() || name.contains(['/', '\0']) {
                 continue;
             }
-            let attrs = e.metadata();
             let ft = attrs.file_type();
+            let (perm_str, owner) = match parse_longname(&longname) {
+                Some((p, o)) => (p, o),
+                None => (attrs.permissions.map(mode_string).unwrap_or_default(), owner_group(&attrs)),
+            };
             let mut entry = DirEntry {
-                size: attrs.size.map(|s| s as i64).unwrap_or(-1),
-                permissions: attrs.permissions.map(mode_string).unwrap_or_default(),
-                owner_group: owner_group(&attrs),
+                size: attrs.size.filter(|s| *s <= i64::MAX as u64).map(|s| s as i64).unwrap_or(-1),
+                permissions: perm_str,
+                owner_group: owner,
                 time: attrs
                     .mtime
                     .map(|t| DateTime::from_unix_secs(i64::from(t), Accuracy::Seconds))
@@ -480,6 +527,31 @@ impl SftpClient {
         Ok(out)
     }
 
+    /// Size, time and type of one path; `None` if it does not exist.
+    pub async fn stat(&self, path: &str) -> Result<Option<DirEntry>> {
+        match self.sftp.metadata(path).await {
+            Ok(a) => Ok(Some(DirEntry {
+                name: path.rsplit('/').next().unwrap_or("").to_owned(),
+                size: if a.file_type().is_dir() { -1 } else { a.size.map(|s| s as i64).unwrap_or(-1) },
+                time: a.mtime.map(|t| DateTime::from_unix_secs(i64::from(t), Accuracy::Seconds)).unwrap_or_default(),
+                flags: if a.file_type().is_dir() { FLAG_DIR } else { 0 },
+                ..Default::default()
+            })),
+            Err(SftpError::Status(st)) if st.status_code == StatusCode::NoSuchFile => Ok(None),
+            Err(e) => Err(fx(e)).with_context(|| format!("stat {path}")),
+        }
+    }
+
+    /// Set the modification (and access) time.
+    pub async fn set_mtime(&self, path: &str, time: &DateTime) -> Result<()> {
+        let secs = time.unix_millis().ok_or_else(|| anyhow!("no time"))? / 1000;
+        let secs = u32::try_from(secs).map_err(|_| anyhow!("time out of range for SFTP"))?;
+        let mut attrs = FileAttributes::empty();
+        attrs.atime = Some(secs);
+        attrs.mtime = Some(secs);
+        self.sftp.set_metadata(path, attrs).await.map_err(fx).with_context(|| format!("setting the time of {path}"))
+    }
+
     pub async fn is_dir(&self, path: &str) -> Result<bool> {
         Ok(self.sftp.metadata(path).await.map(|m| m.file_type().is_dir()).unwrap_or(false))
     }
@@ -488,9 +560,23 @@ impl SftpClient {
         &self,
         path: &str,
         out: &mut W,
+        progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        self.download_from(path, out, 0, progress).await
+    }
+
+    /// Download from byte `offset` (resume). Returns the bytes read now.
+    pub async fn download_from<W: AsyncWrite + Unpin>(
+        &self,
+        path: &str,
+        out: &mut W,
+        offset: u64,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
         let mut f = self.sftp.open(path).await.map_err(fx).with_context(|| format!("opening {path}"))?;
+        if offset > 0 {
+            f.seek(std::io::SeekFrom::Start(offset)).await.with_context(|| format!("seeking in {path}"))?;
+        }
         let mut buf = vec![0u8; 255 * 1024];
         let mut total = 0u64;
         loop {
@@ -513,9 +599,32 @@ impl SftpClient {
         &self,
         path: &str,
         input: &mut R,
+        progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        self.upload_from(path, input, 0, progress).await
+    }
+
+    /// Upload; with `offset > 0` the remote file is kept and written from
+    /// that position (resume). `input` must already be at the same offset.
+    pub async fn upload_from<R: AsyncRead + Unpin>(
+        &self,
+        path: &str,
+        input: &mut R,
+        offset: u64,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
-        let mut f = self.sftp.create(path).await.map_err(fx).with_context(|| format!("creating {path}"))?;
+        let mut f = if offset == 0 {
+            self.sftp.create(path).await.map_err(fx).with_context(|| format!("creating {path}"))?
+        } else {
+            let mut f = self
+                .sftp
+                .open_with_flags(path, OpenFlags::WRITE)
+                .await
+                .map_err(fx)
+                .with_context(|| format!("opening {path}"))?;
+            f.seek(std::io::SeekFrom::Start(offset)).await.with_context(|| format!("seeking in {path}"))?;
+            f
+        };
         let mut buf = vec![0u8; 255 * 1024];
         let mut total = 0u64;
         loop {
@@ -543,7 +652,12 @@ impl SftpClient {
         self.sftp.remove_file(path).await.map_err(fx).with_context(|| format!("deleting {path}"))
     }
 
-    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+    /// Rename/move. With `overwrite`, an existing target is replaced
+    /// atomically when the server supports `posix-rename@openssh.com`.
+    pub async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
+        if overwrite && self.sftp.posix_rename(from, to).await.map_err(fx).with_context(|| format!("renaming {from} to {to}"))? {
+            return Ok(());
+        }
         self.sftp.rename(from, to).await.map_err(fx).with_context(|| format!("renaming {from} to {to}"))
     }
 
@@ -582,6 +696,9 @@ impl SftpClient {
     }
 
     pub async fn close(self) {
+        if let Some(raw) = &self.raw {
+            let _ = raw.close_session();
+        }
         let _ = self.sftp.close().await;
         let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
     }
@@ -609,6 +726,16 @@ mod tests {
         assert_eq!(mode_string(0o104755), "-rwsr-xr-x");
         assert_eq!(mode_string(0o041777), "drwxrwxrwt");
         assert_eq!(mode_string(0o100600), "-rw-------");
+    }
+
+    #[test]
+    fn longnames() {
+        assert_eq!(
+            parse_longname("drwxr-xr-x    2 alice    staff        4096 Jan  1 00:00 docs"),
+            Some(("drwxr-xr-x".into(), "alice staff".into()))
+        );
+        assert_eq!(parse_longname(""), None);
+        assert_eq!(parse_longname("weird"), None);
     }
 
     #[test]

@@ -489,11 +489,39 @@ impl WebdavClient {
 
     /// Send a request; on a 401 Digest challenge (first time or a stale
     /// nonce) switch to Digest and send it once more.
+    /// `send_once` plus retries for transient answers (429, 502, 503, 504):
+    /// up to 3 retries, honouring `Retry-After` (capped at 30 s).
     async fn send(
         &self,
         method: Method,
         url: Url,
         build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let mut attempt = 0;
+        loop {
+            let resp = self.send_once(method.clone(), url.clone(), &build).await?;
+            let transient = matches!(resp.status().as_u16(), 429 | 502 | 503 | 504);
+            if !transient || attempt >= 3 {
+                return Ok(resp);
+            }
+            attempt += 1;
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(1 << attempt))
+                .min(Duration::from_secs(30));
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn send_once(
+        &self,
+        method: Method,
+        url: Url,
+        build: &impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
         // Until the auth scheme is known the server may answer 401 without
         // reading our request body; never reuse such a connection, or the
@@ -577,6 +605,31 @@ impl WebdavClient {
         Ok(out)
     }
 
+    /// Size/time/type of one path; `None` if it does not exist.
+    pub async fn stat(&self, path: &str) -> Result<Option<DirEntry>> {
+        let resp = self
+            .send(Method::from_bytes(b"PROPFIND")?, self.url_for(path, false), |r| {
+                r.header("Depth", "0")
+                    .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+                    .body(PROPFIND_BODY)
+            })
+            .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if resp.status() != StatusCode::MULTI_STATUS {
+            return Err(status_error(resp.status(), &format!("checking {path}")));
+        }
+        let props = parse_multistatus(&resp.text().await?)?;
+        Ok(props.first().map(|p| DirEntry {
+            name: path.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_owned(),
+            size: if p.is_dir { -1 } else { p.size.unwrap_or(-1) },
+            time: p.mtime.unwrap_or_default(),
+            flags: if p.is_dir { FLAG_DIR } else { 0 },
+            ..Default::default()
+        }))
+    }
+
     pub async fn is_dir(&self, path: &str) -> Result<bool> {
         match self.propfind(path, "0").await {
             Ok(props) => Ok(props.first().is_some_and(|p| p.is_dir)),
@@ -588,11 +641,32 @@ impl WebdavClient {
         &self,
         path: &str,
         out: &mut W,
-        mut progress: impl FnMut(u64),
+        progress: impl FnMut(u64),
     ) -> Result<u64> {
-        let mut resp = self.send(Method::GET, self.url_for(path, false), |r| r).await?;
+        Ok(self.download_from(path, out, 0, progress).await?.0)
+    }
+
+    /// Download from byte `offset` with an HTTP Range request. Returns the
+    /// bytes written and whether the server honoured the range; if it did
+    /// not (HTTP 200), the whole file was sent and the caller must have
+    /// discarded what it had (see `truncate_on_restart`).
+    pub async fn download_from<W: AsyncWrite + Unpin>(
+        &self,
+        path: &str,
+        out: &mut W,
+        offset: u64,
+        mut progress: impl FnMut(u64),
+    ) -> Result<(u64, bool)> {
+        let range = format!("bytes={offset}-");
+        let mut resp = self
+            .send(Method::GET, self.url_for(path, false), |r| if offset > 0 { r.header(reqwest::header::RANGE, range.as_str()) } else { r })
+            .await?;
         if !resp.status().is_success() {
             return Err(status_error(resp.status(), &format!("downloading {path}")));
+        }
+        let ranged = offset == 0 || resp.status() == StatusCode::PARTIAL_CONTENT;
+        if !ranged {
+            bail!("RANGE_IGNORED: the server does not support resuming downloads of {path}");
         }
         let mut total = 0u64;
         while let Some(chunk) = resp.chunk().await.with_context(|| format!("downloading {path}"))? {
@@ -601,7 +675,7 @@ impl WebdavClient {
             progress(total);
         }
         out.flush().await?;
-        Ok(total)
+        Ok((total, ranged))
     }
 
     /// Upload `size` bytes from `input` (a file) to `path`.
@@ -610,6 +684,20 @@ impl WebdavClient {
         path: &str,
         input: R,
         size: u64,
+        progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        self.upload_with_mtime(path, input, size, None, progress).await
+    }
+
+    /// Upload, asking the server to keep `mtime` (Unix seconds) as the
+    /// file's modification time. Nextcloud and ownCloud honour the
+    /// `X-OC-Mtime` header; other servers ignore it.
+    pub async fn upload_with_mtime<R: AsyncRead + Unpin + Send + 'static>(
+        &self,
+        path: &str,
+        input: R,
+        size: u64,
+        mtime: Option<i64>,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
         // A streamed body cannot be sent twice, so settle authentication
@@ -631,7 +719,12 @@ impl WebdavClient {
         let stream = tokio_util::io::ReaderStream::with_capacity(Counting { inner: input, count: count.clone() }, 256 * 1024);
         let send = self
             .request(Method::PUT, self.url_for(path, false))
-            .header(CONTENT_LENGTH, HeaderValue::from(size))
+            .header(CONTENT_LENGTH, HeaderValue::from(size));
+        let send = match mtime {
+            Some(t) => send.header("X-OC-Mtime", t.to_string()),
+            None => send,
+        };
+        let send = send
             .body(reqwest::Body::wrap_stream(stream))
             .send();
         tokio::pin!(send);
@@ -691,13 +784,14 @@ impl WebdavClient {
         }
     }
 
-    /// Server-side move; refuses to overwrite an existing target.
-    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+    /// Server-side move. Without `overwrite` an existing target is refused
+    /// (`Overwrite: F`, HTTP 412).
+    pub async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
         let dir = self.is_dir(from).await?;
         let dest = self.url_for(to, dir);
         let resp = self
             .send(Method::from_bytes(b"MOVE")?, self.url_for(from, dir), |r| {
-                r.header("Destination", dest.as_str()).header("Overwrite", "F")
+                r.header("Destination", dest.as_str()).header("Overwrite", if overwrite { "T" } else { "F" })
             })
             .await?;
         if resp.status().is_success() {

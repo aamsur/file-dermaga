@@ -133,6 +133,8 @@ pub struct Features {
     pub mdtm: bool,
     pub epsv: bool,
     pub rest_stream: bool,
+    /// `MFMT`: set a file's modification time.
+    pub mfmt: bool,
     pub raw: Vec<String>,
 }
 
@@ -368,6 +370,7 @@ impl FtpClient {
                     "SIZE" => f.size = true,
                     "MDTM" => f.mdtm = true,
                     "REST" if upper.contains("STREAM") => f.rest_stream = true,
+                    "MFMT" => f.mfmt = true,
                     _ => {}
                 }
                 f.raw.push(line.to_owned());
@@ -582,8 +585,23 @@ impl FtpClient {
         &mut self,
         path: &str,
         out: &mut W,
+        progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        self.retrieve_from(path, out, 0, progress).await
+    }
+
+    /// Download starting at byte `offset` (`REST` + `RETR`), for resuming.
+    /// Returns the number of bytes received in this call.
+    pub async fn retrieve_from<W: AsyncWrite + Unpin>(
+        &mut self,
+        path: &str,
+        out: &mut W,
+        offset: u64,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
+        if offset > 0 {
+            self.expect(&format!("REST {offset}"), 3).await?;
+        }
         let mut data = self.data_command(&format!("RETR {path}")).await?;
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0u64;
@@ -609,9 +627,22 @@ impl FtpClient {
         &mut self,
         path: &str,
         input: &mut R,
+        progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        self.store_mode(path, input, false, progress).await
+    }
+
+    /// Upload; with `append` the data is added to the end of the remote
+    /// file (`APPE`), which is how an interrupted upload is resumed.
+    pub async fn store_mode<R: AsyncRead + Unpin>(
+        &mut self,
+        path: &str,
+        input: &mut R,
+        append: bool,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
-        let mut data = self.data_command(&format!("STOR {path}")).await?;
+        let verb = if append { "APPE" } else { "STOR" };
+        let mut data = self.data_command(&format!("{verb} {path}")).await?;
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0u64;
         loop {
@@ -642,6 +673,17 @@ impl FtpClient {
         drop(data);
         self.finish_transfer().await?;
         Ok(total)
+    }
+
+    /// Set the modification time (`MFMT`); `Ok(false)` if unsupported.
+    pub async fn set_mtime(&mut self, path: &str, time: &DateTime) -> Result<bool> {
+        if !self.features.mfmt {
+            return Ok(false);
+        }
+        let Some(t) = time.to_tm() else { return Ok(false) };
+        let stamp = format!("{:04}{:02}{:02}{:02}{:02}{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second);
+        let r = self.command(&format!("MFMT {stamp} {path}")).await?;
+        Ok(r.class() == 2)
     }
 
     pub async fn mkdir(&mut self, path: &str) -> Result<()> {

@@ -136,6 +136,120 @@ const S = {
   sites: [],
 };
 
+// Transfer settings (Transfer > Transfer settings…)
+const EXISTS_ACTIONS = [
+  ["ask", "Ask"],
+  ["overwrite", "Overwrite"],
+  ["newer", "Overwrite if source is newer"],
+  ["size", "Overwrite if size differs"],
+  ["size-or-newer", "Overwrite if size differs or source is newer"],
+  ["resume", "Resume"],
+  ["skip", "Skip"],
+];
+const TS_DEFAULTS = { downloadExists: "ask", uploadExists: "ask", preserveTime: false, limit: false, down: 1000, up: 100, maxTransfers: 2 };
+const TS = { ...TS_DEFAULTS, ...(store("fdm.transferSettings") || {}) };
+
+function applyTransferSettings() {
+  return invoke("set_transfer_limits", {
+    downKib: TS.limit ? Math.max(0, TS.down | 0) : 0,
+    upKib: TS.limit ? Math.max(0, TS.up | 0) : 0,
+    maxTransfers: Math.min(10, Math.max(1, TS.maxTransfers | 0)),
+  }).catch((e) => log("error", errText(e)));
+}
+
+async function transferSettings() {
+  const sel = (name) => el("select", { name }, EXISTS_ACTIONS.map(([v, l]) => el("option", { value: v, selected: TS[name] === v }, l)));
+  const num = (name, attrs = {}) => el("input", { name, type: "number", min: "0", value: TS[name], style: "width:110px", ...attrs });
+  const chk = (name) => el("input", { type: "checkbox", name, checked: TS[name] });
+  const form = el(
+    "form",
+    { class: "settings", onsubmit: (e) => e.preventDefault() },
+    el("h3", {}, "When the target file already exists"),
+    el("label", {}, "Downloads:"), sel("downloadExists"),
+    el("label", {}, "Uploads:"), sel("uploadExists"),
+    el("div", { class: "hint" }, "Resume continues an interrupted transfer (uploads: FTP and SFTP; other protocols overwrite)."),
+    el("h3", {}, "Timestamps"),
+    el("label", {}, ""), el("label", { class: "check" }, chk("preserveTime"), "Preserve modification time of transferred files"),
+    el("h3", {}, "Speed limits"),
+    el("label", {}, ""), el("label", { class: "check" }, chk("limit"), "Enable speed limits"),
+    el("label", {}, "Download (KiB/s):"), num("down"),
+    el("label", {}, "Upload (KiB/s):"), num("up"),
+    el("h3", {}, "Queue"),
+    el("label", {}, "Simultaneous transfers:"), num("maxTransfers", { min: "1", max: "10" }),
+  );
+  const ok = await dialog("Transfer settings", form, [
+    { label: "Cancel", value: false },
+    { label: "OK", value: true, primary: true },
+  ]);
+  if (!ok) return;
+  for (const f of form.elements) {
+    if (!f.name) continue;
+    TS[f.name] = f.type === "checkbox" ? f.checked : f.type === "number" ? Number(f.value) : f.value;
+  }
+  store("fdm.transferSettings", TS);
+  S.conflictDefaults = {};
+  applyTransferSettings();
+}
+
+// "Target file already exists" questions from running transfers.
+const conflicts = {
+  waiting: [],
+  busy: false,
+  push(c) {
+    const remembered = S.conflictDefaults?.[c.direction];
+    if (remembered) return this.answer(c, remembered);
+    this.waiting.push(c);
+    this.next();
+  },
+  answer(c, action, name = null) {
+    return invoke("conflict_answer", { promptId: c.promptId, action, name }).catch((e) => log("error", errText(e)));
+  },
+  async next() {
+    if (this.busy || !this.waiting.length) return;
+    this.busy = true;
+    const c = this.waiting.shift();
+    const remembered = S.conflictDefaults?.[c.direction];
+    if (remembered) {
+      await this.answer(c, remembered);
+    } else {
+      await this.ask(c);
+    }
+    this.busy = false;
+    this.next();
+  },
+  async ask(c) {
+    const info = (label, path, size, mtime) =>
+      el("div", { class: "cf-file" }, el("b", {}, label), el("div", { class: "cf-path", title: path }, path),
+        el("div", { class: "cf-meta" }, `${size == null ? "size unknown" : fmtSize(size) + (size >= 1024 ? ` (${size.toLocaleString()} bytes)` : " bytes")}, ${mtime == null ? "date unknown" : fmtTime(mtime, "s")}`));
+    const radios = el("div", { class: "cf-actions" },
+      [...EXISTS_ACTIONS.filter(([v]) => v !== "ask"), ["rename", "Rename"]].map(([v, l], i) =>
+        el("label", { class: "check" }, el("input", { type: "radio", name: "cf-action", value: v, checked: i === 0 }), l)));
+    const remember = el("input", { type: "checkbox" });
+    const body = [
+      el("p", {}, `The target file already exists (${c.direction}). Choose what to do:`),
+      info("Source", c.sourcePath, c.sourceSize, c.sourceMtime),
+      info("Target", c.targetPath, c.targetSize, c.targetMtime),
+      radios,
+      el("label", { class: "check" }, remember, `Use this action for all remaining ${c.direction}s in this session`),
+    ];
+    const res = await dialog("Target file already exists", body, [
+      { label: "Skip", value: "skip", id: "cancel" },
+      { label: "OK", value: () => radios.querySelector("input:checked").value, primary: true },
+    ]);
+    let action = res || "skip";
+    if (remember.checked && action !== "rename") {
+      S.conflictDefaults = { ...(S.conflictDefaults || {}), [c.direction]: action };
+    }
+    if (action === "rename") {
+      const base = c.targetPath.split("/").pop();
+      const name = await promptDlg("Rename", "New name for the transferred file:", base);
+      if (!name) action = "skip";
+      else return this.answer(c, "rename", name);
+    }
+    return this.answer(c, action);
+  },
+};
+
 async function loadSites() {
   try {
     S.sites = await invoke("sites_load");
@@ -889,9 +1003,11 @@ async function renameSelected(pane) {
   if (!name || name === e.name) return;
   const from = pane.join(e.name);
   const to = name.startsWith("/") ? name : pane.join(name);
+  const exists = !name.includes("/") && pane.entries.some((x) => x.name === name);
+  if (exists && !(await confirmDlg("Target exists", `"${name}" already exists. Replace it?`, "Replace"))) return;
   try {
-    if (pane.remote) await invoke("remote_rename", { session: S.session, from, to });
-    else await invoke("local_rename", { from, to });
+    if (pane.remote) await invoke("remote_rename", { session: S.session, from, to, overwrite: exists });
+    else await invoke("local_rename", { from, to, overwrite: exists });
     await pane.refresh();
     if (!name.includes("/")) {
       pane.select(name);
@@ -944,6 +1060,11 @@ async function transferSelected(from, targetDir = null, entries = null) {
       remote: from.remote ? from.join(e.name) : joinPath(dest, e.name),
       isDir: e.isDir,
       size: e.isDir || e.size < 0 ? null : e.size,
+      mtime: from.remote && !e.isDir ? e.mtime ?? null : null,
+      mtimeAcc: from.remote && !e.isDir ? e.mtimeAcc ?? null : null,
+      downloadExists: TS.downloadExists,
+      uploadExists: TS.uploadExists,
+      preserveTime: !!TS.preserveTime,
     };
     queue.start(req);
   }
@@ -1027,6 +1148,7 @@ const queue = {
       case "done":
         it.state = "done";
         it.done = ev.done;
+        it.note = ev.error || null;
         it.cur = null;
         this.afterFinish(it);
         break;
@@ -1069,7 +1191,7 @@ const queue = {
   statusCell(it) {
     if (it.state === "queued") return "Queued";
     if (it.state === "failed") return el("span", { class: "status-failed", title: it.error }, it.error || "Failed");
-    if (it.state === "done") return el("span", { class: "status-ok" }, "Transferred");
+    if (it.state === "done") return el("span", { class: "status-ok" }, it.note ? (/^Skipped/.test(it.note) ? it.note : `Transferred (${it.note})`) : "Transferred");
     const total = it.fileTotal;
     const secs = Math.max(0.001, (performance.now() - (it.fileStarted || performance.now())) / 1000);
     const rate = it.done / secs;
@@ -1819,6 +1941,8 @@ const MENUS = {
     "-",
     { label: "Cancel all transfers", action: COMMANDS["cancel-all"] },
     { label: "Clear finished transfers", action: () => queue.clearFinished() },
+    "-",
+    { label: "Transfer settings…", action: transferSettings },
   ],
   server: () => [
     { label: "Disconnect", key: "Ctrl+D", disabled: S.session == null, action: COMMANDS.disconnect },
@@ -1908,6 +2032,8 @@ async function init() {
   await listen("log", (e) => log(e.payload.kind, e.payload.text));
   loadSites();
   await listen("transfer", (e) => queue.onEvent(e.payload));
+  await listen("transfer-conflict", (e) => conflicts.push(e.payload));
+  applyTransferSettings();
 
   panes.remote.clear("Not connected to any server");
   setConnState("Not connected");
@@ -1918,6 +2044,6 @@ async function init() {
 }
 
 // Exposed for development self-tests (FILE_DERMAGA_GUI_SELFTEST, debug builds).
-window.fdm = { S, panes, queue, connect, disconnect, transferSelected, invoke };
+window.fdm = { S, panes, queue, connect, disconnect, transferSelected, invoke, TS, conflicts, transferSettings };
 
 init().catch((e) => log("error", `Startup failed: ${errText(e)}`));
