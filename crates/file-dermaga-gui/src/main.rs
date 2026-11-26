@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Semaphore;
 
-/// Transfers running at the same time.
-const MAX_PARALLEL_TRANSFERS: usize = 2;
+/// Transfers running at the same time (default of Transfer settings, see TS_DEFAULTS in app.js).
+const MAX_PARALLEL_TRANSFERS: usize = 5;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -106,18 +106,22 @@ struct EntryDto {
     target: Option<String>,
 }
 
+fn acc_str(a: Accuracy) -> &'static str {
+    match a {
+        Accuracy::Days => "d",
+        Accuracy::Hours => "h",
+        Accuracy::Minutes => "m",
+        _ => "s",
+    }
+}
+
 impl From<DirEntry> for EntryDto {
     fn from(e: DirEntry) -> Self {
         let is_dir = e.is_dir();
         let is_link = e.is_link();
         Self {
             mtime: e.time.unix_millis(),
-            mtime_acc: match e.time.accuracy() {
-                Accuracy::Days => "d",
-                Accuracy::Hours => "h",
-                Accuracy::Minutes => "m",
-                _ => "s",
-            },
+            mtime_acc: acc_str(e.time.accuracy()),
             name: e.name,
             size: e.size,
             is_dir,
@@ -1224,6 +1228,59 @@ fn transfer_start(app: AppHandle, state: State<'_, AppState>, req: TransferReque
     Ok(id)
 }
 
+/// One file of a folder transfer, queued as its own transfer.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedFileDto {
+    local: String,
+    remote: String,
+    size: Option<u64>,
+    mtime: Option<i64>,
+    mtime_acc: &'static str,
+}
+
+/// Lists a folder transfer file by file so the queue shows every file and runs
+/// them in parallel (Transfer settings > Simultaneous transfers). Creates the
+/// target directories, including empty ones, before returning.
+#[tauri::command]
+async fn transfer_plan(app: AppHandle, state: State<'_, AppState>, req: TransferRequest) -> CmdResult<Vec<PlannedFileDto>> {
+    let session = state.session(req.session)?;
+    let upload = req.direction == "upload";
+    let (src, dst) = if upload { (&req.local, &req.remote) } else { (&req.remote, &req.local) };
+    log(&app, "status", format!("Listing \"{src}\" for transfer to \"{dst}\"..."));
+    let mut backend = session.transfer_backend().await.map_err(err_chain)?;
+    let remote = backend_path(&session, &req.remote);
+    let local = PathBuf::from(&req.local);
+    let app2 = app.clone();
+    let mut on_event = move |ev: Event| {
+        if let Event::Skipped { path, reason } = ev {
+            log(&app2, "status", format!("Skipped {path}: {reason}"));
+        }
+    };
+    let res = if upload {
+        backend.plan_upload(&local, &remote, &mut on_event).await
+    } else {
+        backend.plan_download(&remote, &local, &mut on_event).await
+    };
+    backend.close().await;
+    let files = res.map_err(|e| {
+        let msg = err_chain(e);
+        log(&app, "error", format!("Could not list \"{src}\": {msg}"));
+        msg
+    })?;
+    log(&app, "status", format!("Queued {} file(s) from \"{src}\"", files.len()));
+    Ok(files
+        .into_iter()
+        .map(|f| PlannedFileDto {
+            local: f.rel.split('/').fold(local.clone(), |p, part| p.join(part)).display().to_string(),
+            remote: file_dermaga_transfer::join(&req.remote, &f.rel),
+            size: f.info.size,
+            mtime: f.info.mtime.as_ref().and_then(ms_of),
+            mtime_acc: f.info.mtime.as_ref().map_or("s", |t| acc_str(t.accuracy())),
+        })
+        .collect())
+}
+
 enum TransferUpdate {
     Progress(u64, Option<u64>),
     File { local: String, remote: String, total: Option<u64> },
@@ -1455,11 +1512,14 @@ const HOMEPAGE: &str = env!("CARGO_PKG_REPOSITORY");
 struct AppInfo {
     version: &'static str,
     homepage: &'static str,
+    /// True while a FILE_DERMAGA_GUI_SELFTEST script drives the window (debug builds).
+    selftest: bool,
 }
 
 #[tauri::command]
 fn app_info() -> AppInfo {
-    AppInfo { version: APP_VERSION, homepage: HOMEPAGE }
+    let selftest = cfg!(debug_assertions) && std::env::var_os("FILE_DERMAGA_GUI_SELFTEST").is_some();
+    AppInfo { version: APP_VERSION, homepage: HOMEPAGE, selftest }
 }
 
 /// Opens the project homepage in the default browser. Takes no URL from the
@@ -1534,6 +1594,7 @@ fn main() {
             local_delete,
             local_rename,
             transfer_start,
+            transfer_plan,
             transfer_cancel,
             conflict_answer,
             set_transfer_limits,

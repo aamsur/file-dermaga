@@ -107,6 +107,14 @@ pub enum Event {
     Failed { path: String, error: String },
 }
 
+/// One file of a directory tree (see `plan_download` / `plan_upload`).
+#[derive(Clone, Debug)]
+pub struct TreeFile {
+    /// Path below the tree's root, with `/` separators ("sub/a.txt").
+    pub rel: String,
+    pub info: FileInfo,
+}
+
 pub fn join(base: &str, name: &str) -> String {
     file_dermaga_ftp::join(base, name)
 }
@@ -495,6 +503,67 @@ impl Backend {
             Backend::Sftp(c) => c.close().await,
             Backend::S3(_) | Backend::Webdav(_) => {}
         }
+    }
+
+    /// Walk the remote tree `remote` for a download that is queued file by file:
+    /// creates the local directories (empty ones too) and returns every file,
+    /// sorted by its path relative to `remote`.
+    pub async fn plan_download(&mut self, remote: &str, local: &Path, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Vec<TreeFile>> {
+        let mut files = Vec::new();
+        let mut stack = vec![(remote.to_owned(), local.to_path_buf(), String::new())];
+        while let Some((rdir, ldir, rel)) = stack.pop() {
+            tokio::fs::create_dir_all(&ldir).await?;
+            for e in self.list(&rdir).await? {
+                let name = safe_name(&e.name)?;
+                let rp = join(&rdir, name);
+                let r = if rel.is_empty() { name.to_owned() } else { format!("{rel}/{name}") };
+                if e.is_dir() {
+                    if e.is_link() {
+                        ev(Event::Skipped { path: rp, reason: "symbolic link".into() });
+                    } else {
+                        stack.push((rp, ldir.join(name), r));
+                    }
+                } else {
+                    files.push(TreeFile { rel: r, info: info_of(&e) });
+                }
+            }
+        }
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        Ok(files)
+    }
+
+    /// Walk the local tree `local` for an upload that is queued file by file:
+    /// creates the remote directories (empty ones too) and returns every file,
+    /// sorted by its path relative to `local`.
+    pub async fn plan_upload(&mut self, local: &Path, remote: &str, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Vec<TreeFile>> {
+        self.mkdir_all(remote).await?;
+        let mut files = Vec::new();
+        let mut stack = vec![(local.to_path_buf(), remote.to_owned(), String::new())];
+        while let Some((ldir, rdir, rel)) = stack.pop() {
+            if !rel.is_empty() && !self.implicit_dirs() {
+                // Parents exist by now; fails harmlessly if it already exists.
+                let _ = self.mkdir(&rdir).await;
+            }
+            let mut rd = tokio::fs::read_dir(&ldir).await?;
+            while let Some(de) = rd.next_entry().await? {
+                let name = de.file_name().to_string_lossy().into_owned();
+                let path = de.path();
+                let meta = tokio::fs::metadata(&path).await?;
+                let is_link = tokio::fs::symlink_metadata(&path).await?.file_type().is_symlink();
+                let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                if meta.is_dir() {
+                    if is_link {
+                        ev(Event::Skipped { path: path.display().to_string(), reason: "symbolic link".into() });
+                    } else {
+                        stack.push((path, join(&rdir, &name), r));
+                    }
+                } else if meta.is_file() {
+                    files.push(TreeFile { rel: r, info: local_info(&meta) });
+                }
+            }
+        }
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        Ok(files)
     }
 
     /// Download a directory tree into `local`.

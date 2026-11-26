@@ -184,21 +184,29 @@ button.primary { background: var(--sel); color: var(--sel-fg); border-color: var
 #panes { display: grid; grid-template-columns: var(--left-w) 5px 1fr; min-height: 0; }
 .side {
   display: grid;
-  grid-template-rows: auto var(--tree-h) 5px 1fr auto;
-  grid-template-areas: "path" "tree" "treesplit" "list" "status";
+  grid-template-rows: auto var(--tree-h) 5px auto 1fr auto;
+  grid-template-areas: "path" "tree" "treesplit" "search" "list" "status";
   min-height: 0;
   min-width: 0;
 }
 .side .pathbar { grid-area: path; }
 .side .tree { grid-area: tree; }
 .side .splitter.inner { grid-area: treesplit; }
+.side .searchbar { grid-area: search; }
 .side .list { grid-area: list; }
 .side .statusline { grid-area: status; }
-.side.no-tree { grid-template-rows: auto 0 0 1fr auto; }
+.side.no-tree { grid-template-rows: auto 0 0 auto 1fr auto; }
 .side.no-tree .tree, .side.no-tree .splitter.inner { display: none; }
 .pathbar { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: var(--panel); border: 1px solid var(--border); border-bottom: 0; }
 .pathbar label { white-space: nowrap; }
 .pathbar .path { flex: 1; min-width: 0; }
+.searchbar { display: flex; align-items: center; gap: 6px; padding: 3px 4px 3px 8px; background: var(--header); border: 1px solid var(--border); border-bottom: 0; }
+.searchbar[hidden] { display: none; }
+.searchbar > svg { width: 15px; height: 15px; flex: none; fill: none; stroke: var(--muted); stroke-width: 1.8; stroke-linecap: round; }
+.searchbar .search { flex: 1; min-width: 0; }
+.searchbar.nomatch .search { outline: 1px solid var(--danger); }
+.pathbtn.on { color: var(--focus); }
+.list mark { background: rgba(246, 211, 45, 0.55); color: inherit; border-radius: 2px; padding: 0; }
 .statusline { padding: 3px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: var(--panel); border: 1px solid var(--border); border-top: 0; min-height: 22px; }
 
 /* Directory tree */
@@ -324,3 +332,4 @@ form.settings .check, .cf-actions .check, .dialog .body > .check { display: flex
 .cf-meta { color: var(--muted); font-size: 12px; }
 .cf-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; margin: 10px 0; }
 .kbd-label { display: block; margin: 8px 0 3px; }
+.tnode.ctx .lbl { outline: 2px solid var(--focus); outline-offset: -1px; }

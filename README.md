@@ -84,6 +84,7 @@ A Rust toolchain ≥ 1.85 is required ([rustup.rs](https://rustup.rs)).
 | `Backspace` | Parent directory |
 | `Enter` | Open folder / transfer file |
 | `Ctrl+A` | Select all |
+| `Ctrl+F` | Search the files in the current folder (`Esc` closes, `Enter` jumps to the results) |
 | `Ctrl+H` | Show/hide hidden files |
 | `Ctrl+S` | Site Manager |
 | `Ctrl+D` / `Ctrl+R` | Disconnect / reconnect |

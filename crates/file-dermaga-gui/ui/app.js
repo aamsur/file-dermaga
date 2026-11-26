@@ -146,7 +146,7 @@ const EXISTS_ACTIONS = [
   ["resume", "Resume"],
   ["skip", "Skip"],
 ];
-const TS_DEFAULTS = { downloadExists: "ask", uploadExists: "ask", preserveTime: false, limit: false, down: 1000, up: 100, maxTransfers: 2 };
+const TS_DEFAULTS = { downloadExists: "ask", uploadExists: "ask", preserveTime: false, limit: false, down: 1000, up: 100, maxTransfers: 5 };
 const TS = { ...TS_DEFAULTS, ...(store("fdm.transferSettings") || {}) };
 
 function applyTransferSettings() {
@@ -320,6 +320,7 @@ function log(kind, text) {
 
 function closePopups() {
   $("#popup-root").replaceChildren();
+  $$(".tnode.ctx").forEach((r) => r.classList.remove("ctx"));
   $$(".menu.open").forEach((m) => m.classList.remove("open"));
 }
 
@@ -443,7 +444,7 @@ class Tree {
     root.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       const row = e.target.closest(".tnode");
-      if (row) this.pane.navigate(row.dataset.path);
+      if (row) this.contextMenu(e.clientX, e.clientY, row.dataset.path);
     });
     root.addEventListener("dragover", (e) => this.onDragOver(e));
     root.addEventListener("dragleave", (e) => e.target.closest(".tnode")?.classList.remove("drop"));
@@ -501,6 +502,57 @@ class Tree {
       }
     }
     this.render();
+  }
+
+  /** Re-read the sub-folders of `p` (and the file list when it shows `p`). */
+  async reload(p) {
+    const n = this.node(p);
+    try {
+      const entries = await this.pane.fetch(p);
+      this.setChildren(p, entries.filter((e) => e.isDir && this.pane.visible(e)).map((e) => e.name));
+      n.open = true;
+    } catch (e) {
+      log("error", errText(e));
+    }
+    if (p === this.pane.path) await this.pane.refresh();
+    this.render();
+  }
+
+  /** Forget cached children of `p` and everything below it (after delete/rename). */
+  forget(p) {
+    for (const k of [...this.nodes.keys()]) if (k === p || k.startsWith(p + "/")) this.nodes.delete(k);
+  }
+
+  /** Same actions as the file list's menu, applied to the folder `p`. */
+  contextMenu(x, y, p) {
+    const pane = this.pane;
+    const other = pane.remote ? panes.local : panes.remote;
+    const s3 = pane.remote && S.info?.s3;
+    const isRoot = p === "/";
+    const parent = parentPath(p);
+    const name = p.split("/").filter(Boolean).pop();
+    const items = [];
+    if (!pane.ready()) {
+      items.push({ label: "Not connected", disabled: true });
+    } else {
+      items.push({
+        label: pane.remote ? "Download" : "Upload",
+        disabled: isRoot || !S.session || !other.ready(),
+        action: () => transferSelected(pane, null, [{ name, isDir: true, size: -1 }], parent),
+      });
+      items.push({ label: "Open", disabled: p === pane.path, action: () => pane.navigate(p, { fromTree: true }) });
+      items.push("-");
+      items.push({ label: s3 && isRoot ? "Create bucket" : "Create directory", action: () => mkdirIn(pane, p) });
+      items.push({ label: "Refresh", action: () => this.reload(p) });
+      items.push("-");
+      items.push({ label: "Delete", disabled: isRoot, action: () => deleteFolder(pane, p) });
+      items.push({ label: "Rename", disabled: isRoot || s3, action: () => renameFolder(pane, p) });
+      items.push("-");
+      items.push({ label: "Copy path to clipboard", action: () => navigator.clipboard?.writeText(p).catch(() => {}) });
+    }
+    popup(x, y, items);
+    // Mark the folder the menu is about (cleared again by closePopups).
+    $(`.tnode[data-path="${CSS.escape(p)}"]`, this.root)?.classList.add("ctx");
   }
 
   onClick(e) {
@@ -588,6 +640,10 @@ class Pane {
     this.listEl = $(".list", this.root);
     this.pathInput = $(".path", this.root);
     this.statusEl = $(".statusline", this.root);
+    this.searchBar = $(".searchbar", this.root);
+    this.searchInput = $(".search", this.root);
+    this.searchBtn = $(".search-btn", this.root);
+    this.query = ""; // lower-cased name filter for the file list ("" = off)
     this.tree = new Tree(this, $(".tree", this.root));
     this.path = null;
     this.entries = [];
@@ -632,6 +688,8 @@ class Pane {
     }
     this.busy = false;
     const samePath = path === this.path;
+    // The search belongs to one folder: entering another folder closes it.
+    if (!samePath) this.resetSearch();
     const keep = keepSelection && samePath ? new Set(this.sel) : new Set();
     this.resetScroll = !samePath;
     this.path = path;
@@ -657,6 +715,7 @@ class Pane {
     this.path = null;
     this.entries = [];
     this.sel.clear();
+    this.resetSearch();
     this.tree.reset();
     this.pathInput.value = "";
     this.listEl.replaceChildren(el("div", { class: "placeholder" }, message));
@@ -668,7 +727,7 @@ class Pane {
     const dir = asc ? 1 : -1;
     const val = (e) => (key === "type" ? fileType(e) : e[key]);
     return this.entries
-      .filter((e) => this.visible(e))
+      .filter((e) => this.visible(e) && this.matches(e))
       .sort((a, b) => {
         if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
         let c;
@@ -682,6 +741,56 @@ class Pane {
 
   selected() {
     return this.entries.filter((e) => this.sel.has(e.name));
+  }
+
+  matches(e) {
+    return !this.query || e.name.toLowerCase().includes(this.query);
+  }
+
+  /** File name with the part matching the search wrapped in <mark>. */
+  markName(name) {
+    if (!this.query) return name;
+    const lower = name.toLowerCase();
+    const i = lower.indexOf(this.query);
+    // Some characters change length when lower-cased; skip the highlight then.
+    if (i < 0 || lower.length !== name.length) return name;
+    const j = i + this.query.length;
+    return [name.slice(0, i), el("mark", {}, name.slice(i, j)), name.slice(j)];
+  }
+
+  /** Show the search box (toolbar button or Ctrl+F in the list). */
+  openSearch() {
+    if (!this.path) return;
+    this.searchBar.hidden = false;
+    this.searchBtn?.classList.add("on");
+    this.searchInput.focus();
+    this.searchInput.select();
+  }
+
+  /** Hide the search box and show every file again. */
+  closeSearch() {
+    const wasFiltered = !!this.query;
+    this.resetSearch();
+    if (wasFiltered && this.path) this.render();
+    this.listEl.focus();
+  }
+
+  resetSearch() {
+    this.query = "";
+    this.searchInput.value = "";
+    this.searchBar.hidden = true;
+    this.searchBar.classList.remove("nomatch");
+    this.searchBtn?.classList.remove("on");
+  }
+
+  setQuery(text) {
+    this.query = text.trim().toLowerCase();
+    const shown = new Set(this.rows().map((e) => e.name));
+    // Never keep hidden files selected: Delete/Upload must only act on what is visible.
+    this.sel = new Set([...this.sel].filter((n) => shown.has(n)));
+    this.searchBar.classList.toggle("nomatch", !!this.query && !shown.size);
+    this.resetScroll = true;
+    this.render();
   }
 
   render() {
@@ -721,7 +830,7 @@ class Pane {
               "td",
               { title: e.target ? `${e.name} -> ${e.target}` : e.name },
               icon(e.isDir ? "folder" : "file", { link: e.isLink }),
-              e.name,
+              this.markName(e.name),
             );
           case "size":
             v = e.isDir ? "" : fmtSize(e.size);
@@ -770,9 +879,13 @@ class Pane {
     if (this.sel.size) {
       this.statusEl.textContent = `Selected ${parts.join(" and ")}.${files.length ? ` Total size: ${fmtSize(total)}` : ""}`;
     } else if (!pick.length) {
-      this.statusEl.textContent = "Empty directory.";
+      this.statusEl.textContent = this.query ? "No files or directories match the search." : "Empty directory.";
     } else {
       this.statusEl.textContent = `${parts.join(" and ")}. Total size: ${fmtSize(total) || "0"}`;
+    }
+    if (this.query && pick.length) {
+      const all = this.entries.filter((e) => this.visible(e)).length;
+      this.statusEl.textContent += ` (search: ${(this.view || []).length} of ${all} shown)`;
     }
   }
 
@@ -810,6 +923,28 @@ class Pane {
       }
     });
     L.addEventListener("focusin", () => (S.activeSide = this.side));
+    this.searchBtn?.addEventListener("click", () => (this.searchBar.hidden ? this.openSearch() : this.closeSearch()));
+    $(".search-close", this.root).addEventListener("click", () => this.closeSearch());
+    this.searchInput.addEventListener("input", () => this.setQuery(this.searchInput.value));
+    this.searchInput.addEventListener("focusin", () => (S.activeSide = this.side));
+    this.searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeSearch();
+      } else if (e.key === "Enter" || e.key === "ArrowDown") {
+        // Jump into the results, selecting the first match.
+        e.preventDefault();
+        const first = this.view?.[0];
+        if (first && !this.view.some((x) => this.sel.has(x.name))) {
+          this.select(first.name);
+          this.reveal(first.name);
+        }
+        L.focus();
+      } else if (e.ctrlKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        this.searchInput.select();
+      }
+    });
     L.addEventListener("mousedown", (e) => {
       const tr = e.target.closest("tbody tr");
       if (e.button === 2 && tr?.dataset.name && this.sel.has(tr.dataset.name)) return;
@@ -927,6 +1062,20 @@ class Pane {
           this.paintSelection();
         }
         break;
+      case "f":
+      case "F":
+        if (e.ctrlKey) {
+          e.preventDefault();
+          this.openSearch();
+        }
+        break;
+      case "Escape":
+        // An open context menu takes Esc first (closed by the global handler).
+        if ((this.query || !this.searchBar.hidden) && !$("#popup-root").childElementCount) {
+          e.preventDefault();
+          this.closeSearch();
+        }
+        break;
     }
     if (!e.shiftKey) this.focusName = null;
   }
@@ -973,19 +1122,21 @@ const panes = {};
 // File operations
 // ---------------------------------------------------------------------------
 
-async function mkdirIn(pane) {
-  const s3Bucket = pane.remote && S.info?.s3 && pane.path === "/";
+/** Create a directory in `dir` (default: the folder shown in the list). */
+async function mkdirIn(pane, dir = pane.path) {
+  const s3Bucket = pane.remote && S.info?.s3 && dir === "/";
   const name = await promptDlg(
     s3Bucket ? "Create bucket" : "Create directory",
-    s3Bucket ? "Please enter the name of the bucket to create:" : `Please enter the name of the directory to create in "${pane.path}":`,
+    s3Bucket ? "Please enter the name of the bucket to create:" : `Please enter the name of the directory to create in "${dir}":`,
     s3Bucket ? "" : "New directory",
   );
   if (!name) return;
   if (name.includes("/")) return alertDlg("Invalid name", "The name must not contain '/'.");
-  const path = pane.join(name);
+  const path = joinPath(dir, name);
   try {
     if (pane.remote) await invoke("remote_mkdir", { session: S.session, path });
     else await invoke("local_mkdir", { path });
+    if (dir !== pane.path) return pane.tree.reload(dir);
     await pane.refresh();
     pane.select(name);
     pane.reveal(name);
@@ -1011,6 +1162,58 @@ async function deleteSelected(pane) {
   }
   pane.sel.clear();
   pane.refresh();
+}
+
+/** Look up the directory entry for `p` in its parent (tells symlinks apart). */
+async function folderEntry(pane, p) {
+  const name = p.split("/").filter(Boolean).pop();
+  const entries = await pane.fetch(parentPath(p));
+  return { entries, entry: entries.find((x) => x.name === name) };
+}
+
+/** After `oldPath` moved to `newPath` (null = deleted), keep list and tree in step. */
+async function folderGone(pane, oldPath, newPath) {
+  const parent = parentPath(oldPath);
+  pane.tree.forget(oldPath);
+  const cur = pane.path;
+  if (cur === oldPath || cur?.startsWith(oldPath + "/")) {
+    await pane.navigate(newPath ? newPath + cur.slice(oldPath.length) : parent);
+  }
+  await pane.tree.reload(parent);
+  if (newPath && parentPath(newPath) !== parent) await pane.tree.reload(parentPath(newPath));
+}
+
+async function deleteFolder(pane, p) {
+  const where = pane.remote ? "from the server" : "from your computer";
+  if (!(await confirmDlg("Confirmation needed", `Really delete "${p}" ${where}?\n\nDirectories are deleted including all their contents.`, "Delete"))) return;
+  try {
+    const { entry } = await folderEntry(pane, p);
+    // A symlink is removed as a link, never by deleting what it points to.
+    const item = { path: p, isDir: !(entry?.isLink ?? false) };
+    if (pane.remote) await invoke("remote_delete", { session: S.session, items: [item] });
+    else await invoke("local_delete", { items: [item] });
+  } catch (e) {
+    alertDlg("Delete failed", errText(e));
+  }
+  await folderGone(pane, p, null);
+}
+
+async function renameFolder(pane, p) {
+  const old = p.split("/").filter(Boolean).pop();
+  const name = await promptDlg("Rename", `Enter the new name for "${old}":`, old);
+  if (!name || name === old) return;
+  const parent = parentPath(p);
+  const to = name.startsWith("/") ? normPath(name) : joinPath(parent, name);
+  try {
+    const { entries } = await folderEntry(pane, p);
+    const exists = !name.includes("/") && entries.some((x) => x.name === name);
+    if (exists && !(await confirmDlg("Target exists", `"${name}" already exists. Replace it?`, "Replace"))) return;
+    if (pane.remote) await invoke("remote_rename", { session: S.session, from: p, to, overwrite: exists });
+    else await invoke("local_rename", { from: p, to, overwrite: exists });
+    await folderGone(pane, p, to);
+  } catch (err) {
+    alertDlg("Rename failed", errText(err));
+  }
 }
 
 async function renameSelected(pane) {
@@ -1058,14 +1261,18 @@ function copyPaths(pane) {
   navigator.clipboard?.writeText(text).catch(() => {});
 }
 
-/** Transfer the selection (or `entries`) of `from` into `targetDir` of the other pane. */
-async function transferSelected(from, targetDir = null, entries = null) {
+/**
+ * Transfer the selection (or `entries`) of `from` into `targetDir` of the other pane.
+ * `srcDir` is the folder holding `entries` (default: the folder shown in `from`).
+ */
+async function transferSelected(from, targetDir = null, entries = null, srcDir = null) {
   if (!S.session) return alertDlg("Not connected", "Connect to a server first.");
   const to = from.remote ? panes.local : panes.remote;
   const items = (entries || from.selected()).filter(Boolean);
   if (!items.length) return;
   const dest = targetDir || to.path;
   if (!dest) return;
+  const src = (name) => joinPath(srcDir ?? from.path, name);
   if (S.info?.s3 && !from.remote && normPath(dest) === "/") {
     return alertDlg("Select a bucket", "Open a bucket on the remote side before uploading.");
   }
@@ -1073,8 +1280,8 @@ async function transferSelected(from, targetDir = null, entries = null) {
     const req = {
       session: S.session,
       direction: from.remote ? "download" : "upload",
-      local: from.remote ? joinPath(dest, e.name) : from.join(e.name),
-      remote: from.remote ? from.join(e.name) : joinPath(dest, e.name),
+      local: from.remote ? joinPath(dest, e.name) : src(e.name),
+      remote: from.remote ? src(e.name) : joinPath(dest, e.name),
       isDir: e.isDir,
       size: e.isDir || e.size < 0 ? null : e.size,
       mtime: from.remote && !e.isDir ? e.mtime ?? null : null,
@@ -1083,7 +1290,39 @@ async function transferSelected(from, targetDir = null, entries = null) {
       uploadExists: TS.uploadExists,
       preserveTime: !!TS.preserveTime,
     };
-    queue.start(req);
+    if (e.isDir) await queueFolder(req);
+    else queue.start(req);
+  }
+}
+
+/**
+ * A folder is listed first and every file in it becomes its own queue entry,
+ * so the queue shows them all and runs them "Simultaneous transfers" at a time.
+ */
+async function queueFolder(req) {
+  const to = req.direction === "upload" ? panes.remote : panes.local;
+  let files;
+  try {
+    files = await invoke("transfer_plan", { req });
+  } catch (e) {
+    log("error", errText(e));
+    return;
+  }
+  // The (now created) top folder appears in the target pane right away.
+  const top = req.direction === "upload" ? req.remote : req.local;
+  if (to.path && parentPath(top) === to.path) to.refresh();
+  // On S3 a folder only exists once a file is in it, so the target pane is
+  // refreshed again when the first and when the last file of the folder finish.
+  const group = { pane: to, dir: parentPath(top), left: 0, refreshed: false };
+  for (const f of files) {
+    const id = await queue.start({ ...req, ...f, isDir: false });
+    if (id == null) continue;
+    const st = queue.items.get(id)?.state;
+    if (st === "done" || st === "failed") queue.groupFileFinished(group);
+    else {
+      group.left++;
+      queue.groups.set(id, group);
+    }
   }
 }
 
@@ -1122,6 +1361,7 @@ const queue = {
   failSeq: 0,
   renderPending: false,
 
+  /** Queue one transfer; resolves with its id (undefined if it could not start). */
   async start(req) {
     let id;
     try {
@@ -1134,6 +1374,27 @@ const queue = {
     Object.assign(it, { req, direction: req.direction, local: req.local, remote: req.remote, total: req.size, server: S.info?.label });
     this.items.set(id, it);
     this.render();
+    return id;
+  },
+
+  /** Folder transfers: transfer id -> { pane, dir, left, refreshed } (see queueFolder). */
+  groups: new Map(),
+
+  groupFileFinished(g) {
+    if (g.refreshed && g.left > 0) return;
+    g.refreshed = true;
+    if (g.pane.path !== g.dir) return;
+    clearTimeout(g.pane.refreshTimer);
+    g.pane.refreshTimer = setTimeout(() => g.pane.refresh(), 300);
+  },
+
+  /** A transfer ended (done, failed or cancelled): update its folder group. */
+  ended(it) {
+    const g = this.groups.get(it.id);
+    if (!g) return;
+    this.groups.delete(it.id);
+    g.left--;
+    this.groupFileFinished(g);
   },
 
   onEvent(ev) {
@@ -1168,17 +1429,20 @@ const queue = {
         it.note = ev.error || null;
         it.cur = null;
         this.afterFinish(it);
+        this.ended(it);
         break;
       case "failed":
         it.state = "failed";
         it.error = ev.error;
         it.cur = null;
         this.afterFinish(it);
+        this.ended(it);
         break;
       case "cancelled":
         it.state = "failed";
         it.error = "Cancelled by user";
         it.cur = null;
+        this.ended(it);
         break;
     }
     this.scheduleRender();
@@ -1187,7 +1451,10 @@ const queue = {
   afterFinish(it) {
     const pane = it.direction === "upload" ? panes.remote : panes.local;
     const target = it.direction === "upload" ? it.remote : it.local;
-    if (pane.path && (parentPath(target) === pane.path || target === pane.path)) pane.refresh();
+    if (!pane.path || !(parentPath(target) === pane.path || target === pane.path)) return;
+    // Many files finishing together (folder transfers) cause one refresh, not one each.
+    clearTimeout(pane.refreshTimer);
+    pane.refreshTimer = setTimeout(() => pane.refresh(), 300);
   },
 
   scheduleRender() {
@@ -1928,36 +2195,7 @@ const COMMANDS = {
     for (const p of Object.values(panes)) if (p.path) p.refresh();
   },
   quit: () => appWindow().close(),
-  about: async () => {
-    const info = await invoke("app_info").catch(() => ({ version: "unknown", homepage: "https://github.com/aamsur/file-dermaga" }));
-    const link = el(
-      "a",
-      {
-        href: info.homepage,
-        onclick: (e) => {
-          e.preventDefault();
-          invoke("open_homepage").catch((err) => log("error", errText(err)));
-        },
-      },
-      info.homepage,
-    );
-    return dialog(
-      "About FileDermaga",
-      el(
-        "div",
-        {},
-        el("p", { class: "about-version" }, `FileDermaga ${info.version}`),
-        el("p", {}, "FTP, FTPS, SFTP, WebDAV and S3 client written in Rust."),
-        el("p", {}, "Homepage: ", link),
-        el(
-          "p",
-          {},
-          "Licensed under the MIT License or the Apache License 2.0, at your option.\nThird-party licenses: /usr/share/doc/file-dermaga/THIRD-PARTY-LICENSES.html",
-        ),
-      ),
-      [{ label: "OK", value: true, primary: true }],
-    );
-  },
+  about: () => showAbout(),
 };
 
 const MENUS = {
@@ -1996,6 +2234,49 @@ const MENUS = {
   ],
   help: () => [{ label: "About FileDermaga", action: COMMANDS.about }],
 };
+
+const HIDE_ABOUT_KEY = "fdm.hideAboutAtStartup";
+
+/** Help > About; also shown at startup until "Don't show" is ticked. */
+async function showAbout() {
+  const info = await invoke("app_info").catch(() => ({ version: "unknown", homepage: "https://github.com/aamsur/file-dermaga" }));
+  const link = el(
+    "a",
+    {
+      href: info.homepage,
+      onclick: (e) => {
+        e.preventDefault();
+        invoke("open_homepage").catch((err) => log("error", errText(err)));
+      },
+    },
+    info.homepage,
+  );
+  const hide = el("input", { type: "checkbox", checked: !!store(HIDE_ABOUT_KEY) });
+  // Saved right away, so closing with Esc keeps the choice too.
+  hide.addEventListener("change", () => store(HIDE_ABOUT_KEY, hide.checked));
+  return dialog(
+    "About FileDermaga",
+    [
+      el("p", { class: "about-version" }, `FileDermaga ${info.version}`),
+      el("p", {}, "FTP, FTPS, SFTP, WebDAV and S3 client written in Rust."),
+      el("p", {}, "Homepage: ", link),
+      el(
+        "p",
+        {},
+        "Licensed under the MIT License or the Apache License 2.0, at your option.\nThird-party licenses: /usr/share/doc/file-dermaga/THIRD-PARTY-LICENSES.html",
+      ),
+      el("label", { class: "check" }, hide, "Don't show this window at startup"),
+    ],
+    [{ label: "OK", value: true, primary: true }],
+  );
+}
+
+async function showAboutAtStartup() {
+  if (store(HIDE_ABOUT_KEY)) return;
+  const info = await invoke("app_info").catch(() => null);
+  if (info?.selftest) return; // automated UI self-tests drive the window themselves
+  showAbout();
+}
 
 async function goLocalHome() {
   try {
@@ -2088,9 +2369,10 @@ async function init() {
   const last = store("fdm.localPath");
   if (!(last && (await panes.local.navigate(last)))) await panes.local.navigate(home);
   panes.local.listEl.focus();
+  showAboutAtStartup();
 }
 
 // Exposed for development self-tests (FILE_DERMAGA_GUI_SELFTEST, debug builds).
-window.fdm = { S, panes, queue, connect, disconnect, transferSelected, invoke, TS, conflicts, transferSettings };
+window.fdm = { S, panes, queue, connect, disconnect, transferSelected, invoke, TS, conflicts, transferSettings, showAbout, showAboutAtStartup };
 
 init().catch((e) => log("error", `Startup failed: ${errText(e)}`));

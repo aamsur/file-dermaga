@@ -51,9 +51,15 @@
         <label for="local-path">Local site:</label>
         <input id="local-path" class="path" spellcheck="false">
         <button type="button" class="pathbtn" id="local-home" title="Go to your home folder (Alt+Home)"><svg viewBox="0 0 24 24"><path d="M4 11.5 12 5l8 6.5M6.5 10v9h4v-5h3v5h4v-9"/></svg></button>
+        <button type="button" class="pathbtn search-btn" title="Search in this folder (Ctrl+F)"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg></button>
       </div>
       <div class="tree block"></div>
       <div class="splitter h inner" data-var="--tree-h"></div>
+      <div class="searchbar" hidden>
+        <svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg>
+        <input class="search" type="text" placeholder="Search in this folder" spellcheck="false" aria-label="Search in this folder">
+        <button type="button" class="pathbtn search-close" title="Close search (Esc)"><svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></svg></button>
+      </div>
       <div class="list block" tabindex="0"></div>
       <div class="statusline"></div>
     </section>
@@ -62,9 +68,15 @@
       <div class="pathbar">
         <label for="remote-path">Remote site:</label>
         <input id="remote-path" class="path" spellcheck="false">
+        <button type="button" class="pathbtn search-btn" title="Search in this folder (Ctrl+F)"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg></button>
       </div>
       <div class="tree block"></div>
       <div class="splitter h inner" data-var="--tree-h"></div>
+      <div class="searchbar" hidden>
+        <svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg>
+        <input class="search" type="text" placeholder="Search in this folder" spellcheck="false" aria-label="Search in this folder">
+        <button type="button" class="pathbtn search-close" title="Close search (Esc)"><svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></svg></button>
+      </div>
       <div class="list block" tabindex="0"></div>
       <div class="statusline"></div>
     </section>
