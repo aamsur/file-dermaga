@@ -245,6 +245,7 @@ table.grid .num { text-align: right; }
 
 /* Queue */
 #queue td { height: 24px; }
+#queue tr.spacer td { padding: 0; border: 0; background: transparent; }
 #queue tr.sel td { background: var(--sel-inactive); }
 .bar { position: relative; height: 15px; border: 1px solid var(--border); border-radius: 3px; background: var(--bg); overflow: hidden; }
 .bar > i { position: absolute; inset: 0 auto 0 0; background: var(--progress); opacity: .75; }

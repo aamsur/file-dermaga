@@ -1314,17 +1314,23 @@ async function queueFolder(req) {
   // On S3 a folder only exists once a file is in it, so the target pane is
   // refreshed again when the first and when the last file of the folder finish.
   const group = { pane: to, dir: parentPath(top), left: 0, refreshed: false };
-  for (const f of files) {
-    const id = await queue.start({ ...req, ...f, isDir: false });
-    if (id == null) continue;
-    const st = queue.items.get(id)?.state;
-    if (st === "done" || st === "failed") queue.groupFileFinished(group);
-    else {
-      group.left++;
-      queue.groups.set(id, group);
+  const epoch = queue.epoch;
+  for (let i = 0; i < files.length; i += QUEUE_BATCH) {
+    if (queue.epoch !== epoch) return; // "Cancel all" / disconnect while queueing
+    const ids = await queue.startMany(files.slice(i, i + QUEUE_BATCH).map((f) => ({ ...req, ...f, isDir: false })), epoch);
+    for (const id of ids) {
+      const st = queue.items.get(id)?.state;
+      if (st === "done" || st === "failed") queue.groupFileFinished(group);
+      else {
+        group.left++;
+        queue.groups.set(id, group);
+      }
     }
   }
 }
+
+/** Files of a folder transfer are handed to the backend in batches of this size. */
+const QUEUE_BATCH = 500;
 
 async function dropOn(targetPane, dir) {
   const drag = S.drag;
@@ -1360,6 +1366,10 @@ const queue = {
   sel: null,
   failSeq: 0,
   renderPending: false,
+  /** Bumped by cancelAll(); folder transfers still being queued stop then. */
+  epoch: 0,
+  /** Height of one queue row in px (measured after the first render). */
+  rowH: 25,
 
   /** Queue one transfer; resolves with its id (undefined if it could not start). */
   async start(req) {
@@ -1370,11 +1380,32 @@ const queue = {
       log("error", errText(e));
       return;
     }
+    this.add(id, req);
+    this.scheduleRender();
+    return id;
+  },
+
+  add(id, req) {
     const it = this.items.get(id) || { id, state: "queued", done: 0 };
     Object.assign(it, { req, direction: req.direction, local: req.local, remote: req.remote, total: req.size, server: S.info?.label });
     this.items.set(id, it);
-    this.render();
-    return id;
+    return it;
+  },
+
+  /** Queue many transfers with one backend call; resolves with their ids. */
+  async startMany(reqs, epoch = this.epoch) {
+    let ids;
+    try {
+      ids = await invoke("transfer_start_many", { reqs });
+    } catch (e) {
+      log("error", errText(e));
+      return [];
+    }
+    ids.forEach((id, i) => this.add(id, reqs[i]));
+    // Cancelled while this batch was on its way: it is stopped too.
+    if (this.epoch !== epoch) await this.cancelAll(this.lastCancelReason);
+    this.scheduleRender();
+    return ids;
   },
 
   /** Folder transfers: transfer id -> { pane, dir, left, refreshed } (see queueFolder). */
@@ -1403,6 +1434,9 @@ const queue = {
       it = { id: ev.id, state: "queued", done: 0, local: ev.local, remote: ev.remote, total: ev.total };
       this.items.set(ev.id, it);
     }
+    const finished = it.state === "done" || it.state === "failed";
+    // Late progress from a transfer that was already cancelled or finished.
+    if (finished && (ev.state === "queued" || ev.state === "active" || ev.state === "progress")) return;
     switch (ev.state) {
       case "queued":
         break;
@@ -1493,10 +1527,19 @@ const queue = {
   },
 
   render() {
+    const box = $("#queue");
     const body = $("#queue tbody");
     const rows = [...this.items.values()].filter((it) => this.inTab(it));
-    body.replaceChildren(
-      ...rows.map((it) => {
+    // Only the rows in view are built (plus a margin), so thousands of queued
+    // files do not block the window; spacer rows keep the scrollbar right.
+    const rh = this.rowH;
+    const headH = $("#queue thead")?.offsetHeight || 0;
+    const first = Math.max(0, Math.floor(Math.max(0, box.scrollTop - headH) / rh) - 10);
+    const last = Math.min(rows.length, first + Math.ceil(box.clientHeight / rh) + 20);
+    const spacer = (n) => (n > 0 ? el("tr", { class: "spacer" }, el("td", { colspan: 6, style: `height:${n * rh}px` })) : null);
+    const parts = [
+      spacer(first),
+      ...rows.slice(first, last).map((it) => {
         const up = it.direction === "upload";
         const localCell = it.child ? it.local : it.cur?.local || it.local;
         const remoteCell = it.child ? it.remote : it.cur?.remote || it.remote;
@@ -1512,7 +1555,18 @@ const queue = {
           el("td", {}, this.statusCell(it)),
         );
       }),
-    );
+      spacer(rows.length - last),
+    ];
+    // replaceChildren() would turn a null (no spacer needed) into the text "null".
+    body.replaceChildren(...parts.filter(Boolean));
+    const real = body.querySelector("tr[data-id]");
+    if (real) {
+      const h = real.getBoundingClientRect().height;
+      if (h > 0 && Math.abs(h - this.rowH) > 0.5) {
+        this.rowH = h;
+        this.scheduleRender();
+      }
+    }
     const counts = { queued: 0, failed: 0, success: 0 };
     for (const it of this.items.values()) {
       if (it.state === "queued" || it.state === "active") counts.queued++;
@@ -1520,9 +1574,18 @@ const queue = {
       else counts.success++;
     }
     $$("#queue-tabs .tab").forEach((t) => {
-      const label = { queued: "Queued files", failed: "Failed transfers", success: "Successful transfers" }[t.dataset.tab];
+      // The tab buttons are built once and only their count text changes:
+      // replacing their content on every frame while transfers run made the
+      // browser drop clicks (the pressed element was gone before release).
+      let count = t.querySelector(".count");
+      if (!count) {
+        const label = { queued: "Queued files", failed: "Failed transfers", success: "Successful transfers" }[t.dataset.tab];
+        count = el("span", { class: "count" });
+        t.replaceChildren(label, count);
+      }
       const c = counts[t.dataset.tab];
-      t.replaceChildren(label, c ? el("span", { class: "count" }, ` (${c})`) : "");
+      const text = c ? ` (${c})` : "";
+      if (count.textContent !== text) count.textContent = text;
       t.classList.toggle("active", t.dataset.tab === this.tab);
     });
     $("#queue-state").textContent = counts.queued ? `Queue: ${counts.queued} item${counts.queued === 1 ? "" : "s"}` : "Queue: empty";
@@ -1532,8 +1595,43 @@ const queue = {
     return invoke("transfer_cancel", { id });
   },
 
-  cancelAll() {
-    for (const it of this.items.values()) if (it.state === "queued" || it.state === "active") this.cancel(it.id);
+  /**
+   * Stop everything that is queued or running. Unfinished files move to
+   * "Failed transfers" (with `reason`), where they can be retried.
+   */
+  async cancelAll(reason = "Cancelled by user") {
+    this.epoch++;
+    this.lastCancelReason = reason;
+    conflicts.waiting = [];
+    try {
+      await invoke("transfer_cancel_all");
+    } catch (e) {
+      log("error", errText(e));
+    }
+    let n = 0;
+    for (const it of this.items.values()) {
+      if (it.state !== "queued" && it.state !== "active") continue;
+      it.state = "failed";
+      it.error = reason;
+      it.cur = null;
+      this.groups.delete(it.id);
+      n++;
+    }
+    if (n) log("status", `${n} unfinished transfer${n === 1 ? "" : "s"} moved to Failed transfers: ${reason}`);
+    this.scheduleRender();
+  },
+
+  retryAll() {
+    const failed = [...this.items.values()].filter((it) => it.state === "failed" && it.req);
+    if (!failed.length) return;
+    if (!S.session) return alertDlg("Not connected", "Connect to the server again to retry.");
+    for (const it of failed) this.items.delete(it.id);
+    const reqs = failed.map((it) => ({ ...it.req, session: S.session }));
+    (async () => {
+      const epoch = this.epoch;
+      for (let i = 0; i < reqs.length && this.epoch === epoch; i += QUEUE_BATCH) await this.startMany(reqs.slice(i, i + QUEUE_BATCH), epoch);
+    })();
+    this.scheduleRender();
   },
 
   clearFinished(which) {
@@ -1554,12 +1652,15 @@ const queue = {
       const t = e.target.closest(".tab");
       if (!t) return;
       this.tab = t.dataset.tab;
+      $("#queue").scrollTop = 0;
       this.render();
     });
     const box = $("#queue");
+    box.addEventListener("scroll", () => this.scheduleRender(), { passive: true });
+    new ResizeObserver(() => this.scheduleRender()).observe(box);
     box.addEventListener("mousedown", (e) => {
-      const tr = e.target.closest("tbody tr");
-      this.sel = tr ? (isNaN(+tr.dataset.id) ? tr.dataset.id : +tr.dataset.id) : null;
+      const id = e.target.closest("tbody tr[data-id]")?.dataset.id;
+      this.sel = id == null ? null : isNaN(+id) ? id : +id;
       this.render();
     });
     box.addEventListener("contextmenu", (e) => {
@@ -1568,6 +1669,7 @@ const queue = {
       popup(e.clientX, e.clientY, [
         { label: "Cancel transfer", disabled: !it || !(it.state === "queued" || it.state === "active"), action: () => this.cancel(it.id) },
         { label: "Retry", disabled: !it || it.state !== "failed" || !it.req, action: () => this.retry(it.id) },
+        { label: "Retry all failed transfers", disabled: ![...this.items.values()].some((x) => x.state === "failed" && x.req), action: () => this.retryAll() },
         "-",
         { label: "Cancel all transfers", action: () => this.cancelAll() },
         { label: "Clear failed transfers", action: () => this.clearFinished("failed") },
@@ -1707,6 +1809,8 @@ async function connect(site) {
 async function disconnect() {
   if (S.session == null) return;
   const id = S.session;
+  // Transfers use their own connections; stop them with the session.
+  await queue.cancelAll("Disconnected from server");
   S.session = null;
   S.info = null;
   try {

@@ -1129,6 +1129,16 @@ fn ms_of(t: &DateTime) -> Option<i64> {
 
 #[tauri::command]
 fn transfer_start(app: AppHandle, state: State<'_, AppState>, req: TransferRequest) -> CmdResult<u64> {
+    start_transfer(&app, &state, req)
+}
+
+/// Queue many transfers in one call (folder transfers with thousands of files).
+#[tauri::command]
+fn transfer_start_many(app: AppHandle, state: State<'_, AppState>, reqs: Vec<TransferRequest>) -> CmdResult<Vec<u64>> {
+    reqs.into_iter().map(|req| start_transfer(&app, &state, req)).collect()
+}
+
+fn start_transfer(app: &AppHandle, state: &AppState, req: TransferRequest) -> CmdResult<u64> {
     let session = state.session(req.session)?;
     let id = state.next_transfer.fetch_add(1, Ordering::Relaxed) + 1;
     let slots = state.slots.clone();
@@ -1385,6 +1395,21 @@ async fn run_transfer(
     res.map(|()| result)
 }
 
+/// Stop every queued and running transfer; returns their ids (the UI marks them failed).
+#[tauri::command]
+fn transfer_cancel_all(state: State<'_, AppState>) -> Vec<u64> {
+    let handles: Vec<_> = state.transfers.lock().unwrap().drain().collect();
+    // Answer open "file exists" questions so nothing waits on them any more.
+    state.prompts.lock().unwrap().clear();
+    handles
+        .into_iter()
+        .map(|(id, h)| {
+            h.abort();
+            id
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn transfer_cancel(app: AppHandle, state: State<'_, AppState>, id: u64) -> CmdResult<()> {
     if let Some(h) = state.transfers.lock().unwrap().remove(&id) {
@@ -1594,7 +1619,9 @@ fn main() {
             local_delete,
             local_rename,
             transfer_start,
+            transfer_start_many,
             transfer_plan,
+            transfer_cancel_all,
             transfer_cancel,
             conflict_answer,
             set_transfer_limits,
