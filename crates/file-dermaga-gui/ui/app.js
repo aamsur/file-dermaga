@@ -375,6 +375,8 @@ function dialog(title, body, buttons) {
       resolve(v);
     };
     const onKey = (e) => {
+      // Stacked dialogs (e.g. a message over the Site Manager): only the top one reacts.
+      if (overlay !== [...document.querySelectorAll(".overlay")].pop()) return;
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -405,7 +407,9 @@ function dialog(title, body, buttons) {
       ),
     );
     overlay.append(el("div", { class: "dialog", role: "dialog" }, el("h2", {}, title), el("div", { class: "body" }, body), actions));
-    $("#popup-root").after(overlay);
+    // A dialog opened from another one (e.g. a message over the Site Manager)
+    // goes after it, so it is drawn on top and receives the keys.
+    ([...document.querySelectorAll(".overlay")].pop() || $("#popup-root")).after(overlay);
     (overlay.querySelector("input, select") || overlay.querySelector("button.primary"))?.focus();
   });
 }
@@ -2154,6 +2158,86 @@ async function siteManager() {
     write();
   };
 
+  const SAME_SITE_KEYS = ["protocol", "host", "port", "user", "endpoint", "accessKey", "basePath"];
+  const sameSite = (a, b) => SAME_SITE_KEYS.every((k) => String(a[k] ?? "") === String(b[k] ?? ""));
+
+  const importSites = async () => {
+    read();
+    const path = await hooks.chooseFile("open", {
+      title: "Import sites",
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Site list (XML)", extensions: ["xml"] }, { name: "All files", extensions: ["*"] }],
+    });
+    if (!path) return;
+    let rep;
+    try {
+      rep = await invoke("sites_import", { path });
+    } catch (e) {
+      return alertDlg("Import sites", errText(e));
+    }
+    const added = [];
+    const dups = [];
+    for (const s of rep.sites) {
+      if (sites.some((x) => sameSite(x, s))) {
+        dups.push(s.name);
+        continue;
+      }
+      let name = s.name;
+      for (let n = 2; sites.some((x) => x.name === name); n++) name = `${s.name} (${n})`;
+      sites.push({ ...s, name, passwordSaved: false });
+      added.push(name);
+    }
+    if (added.length) cur = sites.length - added.length;
+    renderList();
+    write();
+    const from = rep.format === "native" ? "a FileDermaga site list" : "a Site Manager XML export";
+    const parts = [`${added.length} site${added.length === 1 ? "" : "s"} imported from ${from}.`];
+    if (dups.length) parts.push(`Already in your list, not added again (${dups.length}): ${dups.join(", ")}`);
+    if (rep.skipped.length) parts.push(`Not imported (${rep.skipped.length}):\n${rep.skipped.map((s) => `• ${s.name}: ${s.reason}`).join("\n")}`);
+    if (rep.notes.length) parts.push(rep.notes.map((n) => `• ${n}`).join("\n"));
+    if (added.length) parts.push("Press OK or Connect to keep them. Saved passwords go to the system keyring.");
+    await alertDlg("Import sites", parts.join("\n\n"));
+  };
+
+  const exportSites = async () => {
+    read();
+    if (!sites.length) return alertDlg("Export sites", "There are no sites to export.");
+    const format = el(
+      "select",
+      { name: "exportFormat" },
+      el("option", { value: "native" }, "FileDermaga site list (XML)"),
+      el("option", { value: "compat" }, "Site Manager XML for other FTP clients"),
+    );
+    const withSecrets = el("input", { type: "checkbox", name: "exportSecrets" });
+    const ok = await dialog(
+      "Export sites",
+      [
+        el("p", {}, `Export all ${sites.length} site${sites.length === 1 ? "" : "s"} to an XML file.`),
+        el("label", { class: "check" }, "Format:", format),
+        el("label", { class: "check" }, withSecrets, "Include saved passwords and secret keys"),
+        el("div", { class: "hint" }, "Passwords are stored unencrypted in the file (base64 in the other clients' format). Keep it private."),
+      ],
+      [
+        { label: "Cancel", value: null },
+        { label: "Export…", value: true, primary: true },
+      ],
+    );
+    if (!ok) return;
+    const path = await hooks.chooseFile("save", {
+      title: "Export sites",
+      defaultPath: format.value === "native" ? "file-dermaga-sites.xml" : "sites-export.xml",
+      filters: [{ name: "Site list (XML)", extensions: ["xml"] }],
+    });
+    if (!path) return;
+    try {
+      const r = await invoke("sites_export", { path, format: format.value, sites, includePasswords: withSecrets.checked });
+      await alertDlg("Export sites", [`${r.count} site${r.count === 1 ? "" : "s"} exported to ${path}.`, ...r.notes.map((n) => `• ${n}`)].join("\n\n"));
+    } catch (e) {
+      alertDlg("Export sites", errText(e));
+    }
+  };
+
   root.append(
     el(
       "div",
@@ -2166,6 +2250,8 @@ async function siteManager() {
         el("button", { type: "button", onclick: newSite }, "New site"),
         el("button", { type: "button", onclick: dupSite }, "Duplicate"),
         el("button", { type: "button", onclick: delSite, style: "grid-column:1/-1" }, "Delete"),
+        el("button", { type: "button", onclick: importSites, title: "Add sites from a FileDermaga site list or another FTP client's Site Manager XML" }, "Import…"),
+        el("button", { type: "button", onclick: exportSites, title: "Save all sites to an XML file" }, "Export…"),
       ),
     ),
     form,
@@ -2382,6 +2468,12 @@ async function showAboutAtStartup() {
   showAbout();
 }
 
+/** Replaceable for automated UI tests (window.fdm.hooks). */
+const hooks = {
+  /** Native open/save file chooser (tauri-plugin-dialog); resolves with a path or null. */
+  chooseFile: (kind, options) => invoke(`plugin:dialog|${kind}`, { options }),
+};
+
 async function goLocalHome() {
   try {
     await panes.local.navigate(await invoke("local_home"));
@@ -2477,6 +2569,6 @@ async function init() {
 }
 
 // Exposed for development self-tests (FILE_DERMAGA_GUI_SELFTEST, debug builds).
-window.fdm = { S, panes, queue, connect, disconnect, transferSelected, invoke, TS, conflicts, transferSettings, showAbout, showAboutAtStartup };
+window.fdm = { S, panes, queue, connect, disconnect, transferSelected, invoke, TS, conflicts, transferSettings, showAbout, showAboutAtStartup, siteManager, hooks };
 
 init().catch((e) => log("error", `Startup failed: ${errText(e)}`));

@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod site_files;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1578,6 +1580,8 @@ fn selftest_report() {}
 
 fn main() {
     tauri::Builder::default()
+        // Native open/save dialogs (Site Manager import and export).
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU32::new(0),
@@ -1634,6 +1638,8 @@ fn main() {
             path_basename,
             app_info,
             open_homepage,
+            site_files::sites_import,
+            site_files::sites_export,
             selftest_report,
         ])
         .run(tauri::generate_context!())

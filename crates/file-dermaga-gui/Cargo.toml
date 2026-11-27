@@ -28,6 +28,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Saved passwords / secret keys live in the OS keyring (Secret Service on Linux).
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "apple-native", "windows-native"] }
+# Native file chooser for Site Manager import/export.
+tauri-plugin-dialog = "2"
+# Site list import/export (same XML library as the WebDAV client).
+quick-xml = "0.42"
 
 [features]
 # Production build: serve the embedded UI through Tauri's custom protocol.
